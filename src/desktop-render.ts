@@ -12,6 +12,98 @@ import {
 } from "./reaction-animation-mapping.js";
 import { createSpriteStateCss, defaultPetLayout, type SpriteLayout } from "./browser-render.js";
 
+/**
+ * Escapes HTML-significant characters. Defined at module scope (not inside the
+ * page template) so `renderMarkdownText` can be injected with toString().
+ */
+function escapeHtmlText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/**
+ * Minimal Markdown renderer for assistant replies. Lives outside the page
+ * template on purpose: its regex literals contain backslashes and backticks
+ * that a template string would mangle. Injected with toString().
+ */
+function renderMarkdownText(source: string): string {
+  const escape = escapeHtmlText;
+  const fences: string[] = [];
+  const tick = String.fromCharCode(96);
+  const fenceRe = new RegExp(tick + tick + tick + "([^\\n" + tick + "]*)\\n([\\s\\S]*?)" + tick + tick + tick, "g");
+  const codeRe = new RegExp(tick + "([^" + tick + "\\n]+)" + tick, "g");
+  let text = String(source ?? "").replace(/\r\n?/g, "\n");
+  text = text.replace(fenceRe, (_m: string, _lang: string, code: string) => {
+    fences.push('<pre class="md-pre"><code>' + escape(code.replace(/\n$/, "")) + "</code></pre>");
+    return "%%OPENPETS_FENCE" + (fences.length - 1) + "%%";
+  });
+  const inline = (value: string): string =>
+    value
+      .replace(codeRe, (_m: string, code: string) => '<code class="md-code">' + escape(code) + "</code>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+      .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m: string, label: string, href: string) => '<a href="' + escape(href) + '" target="_blank" rel="noreferrer">' + label + "</a>");
+  const lines = escape(text).split("\n");
+  const out: string[] = [];
+  let list: "ul" | "ol" | null = null;
+  let para: string[] = [];
+  const flushPara = () => {
+    if (para.length === 0) return;
+    out.push("<p>" + inline(para.join("<br>")) + "</p>");
+    para = [];
+  };
+  const closeList = () => {
+    if (list === null) return;
+    out.push("</" + list + ">");
+    list = null;
+  };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const fence = line.match(/^%%OPENPETS_FENCE(\d+)%%$/);
+    if (fence) {
+      flushPara();
+      closeList();
+      out.push(fences[Number(fence[1])]);
+      continue;
+    }
+    if (line.trim() === "") {
+      flushPara();
+      closeList();
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      flushPara();
+      closeList();
+      const level = heading[1].length + 2;
+      out.push("<h" + level + ">" + inline(heading[2]) + "</h" + level + ">");
+      continue;
+    }
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || numbered) {
+      flushPara();
+      const wanted: "ul" | "ol" = bullet ? "ul" : "ol";
+      if (list !== wanted) {
+        closeList();
+        out.push("<" + wanted + ">");
+        list = wanted;
+      }
+      out.push("<li>" + inline((bullet || numbered)![1]) + "</li>");
+      continue;
+    }
+    closeList();
+    para.push(line);
+  }
+  flushPara();
+  closeList();
+  return out.join("");
+}
+
 export interface PetPageOptions {
   readonly scale?: number;
   readonly waitingAnimationDurationMs?: 1010 | 2200;
@@ -79,8 +171,11 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   @keyframes bubble-in { from { opacity: 0; transform: translateX(-50%) translateY(4px) scale(0.96); } to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
   @keyframes status-pulse { 0%, 100% { opacity: 0.52; } 50% { opacity: 1; } }
   /* --- Chat panel (ported from pet-window-styles.ts In-Pet Attached Chat Panel) --- */
-  .openpets-chat-panel { position: absolute; bottom: ${shellHeight + 18}px; left: 50%; transform: translateX(-50%); transform-origin: 50% 100%; width: 390px; min-height: 220px; max-height: 500px; height: fit-content; z-index: 100; box-sizing: border-box; display: none; flex-direction: column; background: linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(240, 245, 255, 0.96) 55%, rgba(237, 233, 254, 0.95) 100%); color: #0f172a; border: 1px solid rgba(226, 232, 240, 0.95); border-radius: 20px; box-shadow: 0 24px 48px -12px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 1); overflow: visible; font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif; pointer-events: auto; -webkit-app-region: no-drag; opacity: 0; color-scheme: light; }
+  .openpets-chat-panel { position: absolute; bottom: ${shellHeight + 18}px; left: 50%; transform: translateX(-50%); transform-origin: 50% 100%; width: 390px; height: 500px; max-height: calc(100vh - ${shellHeight + 26}px); z-index: 100; box-sizing: border-box; display: none; flex-direction: column; overflow: hidden; background: linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(240, 245, 255, 0.96) 55%, rgba(237, 233, 254, 0.95) 100%); color: #0f172a; border: 1px solid rgba(226, 232, 240, 0.95); border-radius: 20px; box-shadow: 0 24px 48px -12px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 1); overflow: visible; font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif; pointer-events: auto; -webkit-app-region: no-drag; opacity: 0; color-scheme: light; }
   html[data-chat-expanded="true"] .openpets-chat-panel { display: flex; opacity: 1; animation: chat-panel-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+  /* Collapsing: keep the panel painted while it plays out, so the window can
+     shrink only after the fade finishes (avoids the one-frame squeeze). */
+  .openpets-chat-panel.is-closing { display: flex; animation: chat-panel-exit 150ms ease-in forwards; }
   .openpets-chat-panel::after { content: ""; position: absolute; left: 50%; bottom: -6px; width: 12px; height: 12px; background: #ede9fe; border-right: 1px solid rgba(226, 232, 240, 0.95); border-bottom: 1px solid rgba(226, 232, 240, 0.95); border-bottom-right-radius: 3px; transform: translateX(-50%) rotate(45deg); box-shadow: 3px 3px 6px rgba(15, 23, 42, 0.08); z-index: 1; }
   .chat-header { height: 46px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(226, 232, 240, 0.9); border-top-left-radius: 19px; border-top-right-radius: 19px; background: rgba(248, 250, 252, 0.8); flex-shrink: 0; user-select: none; }
   .chat-header-left { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -88,7 +183,7 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-title { font-size: 13px; font-weight: 780; color: #0f172a; letter-spacing: -0.01em; white-space: nowrap; }
   .chat-close-btn { width: 26px; height: 26px; border-radius: 50%; border: none; background: transparent; color: #64748b; display: flex; align-items: center; justify-content: center; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; transition: all 140ms ease; font-size: 13px; font-weight: 700; }
   .chat-close-btn:hover { background: rgba(148, 163, 184, 0.16); color: #0f172a; }
-  .chat-transcript { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; min-height: 0; scrollbar-width: thin; scrollbar-color: rgba(148, 163, 184, 0.35) transparent; }
+  .chat-transcript { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; scrollbar-color: rgba(148, 163, 184, 0.35) transparent; overscroll-behavior: contain; }
   .chat-transcript::-webkit-scrollbar { width: 5px; }
   .chat-transcript::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.3); border-radius: 99px; }
   .chat-empty { margin: auto 0; text-align: center; padding: 20px 10px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
@@ -101,12 +196,23 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-msg-bubble { padding: 8px 12px; font-size: 12px; line-height: 16.5px; word-break: break-word; white-space: pre-wrap; }
   .chat-msg.is-user .chat-msg-bubble { background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; border-radius: 14px 14px 2px 14px; box-shadow: 0 2px 6px rgba(37, 99, 235, 0.22); }
   .chat-msg.is-assistant .chat-msg-bubble { background: #ffffff; border: 1px solid rgba(226, 232, 240, 0.95); color: #1e293b; border-radius: 14px 14px 14px 2px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); }
-  .chat-composer { padding: 10px 14px 14px; border-top: 1px solid rgba(226, 232, 240, 0.9); border-bottom-left-radius: 19px; border-bottom-right-radius: 19px; background: rgba(248, 250, 252, 0.85); display: flex; align-items: flex-end; gap: 8px; flex-shrink: 0; }
-  .chat-textarea { flex: 1 1 auto; min-width: 0; min-height: 36px; max-height: 96px; padding: 8px 11px; box-sizing: border-box; border: 1px solid rgba(203, 213, 225, 0.9); border-radius: 12px; background: #ffffff; color: #0f172a; font-family: inherit; font-size: 12px; line-height: 16px; resize: none; outline: none; pointer-events: auto; -webkit-app-region: no-drag; box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.03); transition: border-color 140ms ease, box-shadow 140ms ease; }
+  .chat-msg-bubble > :first-child { margin-top: 0; }
+  .chat-msg-bubble > :last-child { margin-bottom: 0; }
+  .chat-msg-bubble p { margin: 0 0 7px; }
+  .chat-msg-bubble h3, .chat-msg-bubble h4, .chat-msg-bubble h5 { margin: 10px 0 5px; font-size: 12.5px; line-height: 1.35; font-weight: 760; }
+  .chat-msg-bubble ul, .chat-msg-bubble ol { margin: 0 0 7px; padding-left: 18px; }
+  .chat-msg-bubble li { margin: 2px 0; }
+  .chat-msg-bubble li > p { margin: 0; }
+  .chat-msg-bubble a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
+  .chat-msg-bubble .md-code { padding: 1px 4px; border-radius: 4px; background: rgba(148, 163, 184, 0.18); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; }
+  .chat-msg-bubble .md-pre { margin: 0 0 7px; padding: 8px 10px; border-radius: 8px; background: #0f172a; color: #e2e8f0; overflow-x: auto; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; line-height: 1.5; }
+  .chat-msg-bubble .md-pre code { font: inherit; white-space: pre; }
+  .chat-composer { padding: 10px 14px 8px; border-top: 1px solid rgba(226, 232, 240, 0.9); background: rgba(248, 250, 252, 0.85); display: flex; align-items: flex-end; gap: 8px; flex: 0 0 auto; }
+  .chat-textarea { flex: 1 1 auto; min-width: 0; min-height: 46px; max-height: 132px; padding: 11px 13px; box-sizing: border-box; border: 1px solid rgba(203, 213, 225, 0.9); border-radius: 12px; background: #ffffff; color: #0f172a; font-family: inherit; font-size: 13.5px; line-height: 20px; resize: none; outline: none; pointer-events: auto; -webkit-app-region: no-drag; box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.03); transition: border-color 140ms ease, box-shadow 140ms ease; }
   .chat-textarea:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2), inset 0 1px 2px rgba(15, 23, 42, 0.03); }
   .chat-textarea::placeholder { color: #94a3b8; }
-  .chat-send-btn { width: 36px; height: 36px; border-radius: 10px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(37, 99, 235, 0.28); transition: all 140ms ease; }
-  .chat-stop-btn { width: 36px; height: 36px; border-radius: 10px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(225, 29, 72, 0.28); transition: all 140ms ease; }
+  .chat-send-btn { width: 40px; height: 40px; border-radius: 11px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(37, 99, 235, 0.28); transition: all 140ms ease; }
+  .chat-stop-btn { width: 40px; height: 40px; border-radius: 11px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(225, 29, 72, 0.28); transition: all 140ms ease; }
   .chat-stop-btn:hover { background: linear-gradient(135deg, #e11d48 0%, #be123c 100%); box-shadow: 0 3px 8px rgba(225, 29, 72, 0.35); transform: scale(1.02); }
   .chat-stop-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; box-shadow: none; cursor: not-allowed; transform: none; }
   .chat-stop-btn svg { width: 13px; height: 13px; }
@@ -114,8 +220,9 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-send-btn:hover { background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%); box-shadow: 0 3px 8px rgba(37, 99, 235, 0.35); transform: scale(1.02); }
   .chat-send-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; box-shadow: none; cursor: not-allowed; transform: none; }
   .chat-send-btn svg { width: 15px; height: 15px; }
-  .chat-model-line { padding: 0 14px 10px; font-size: 11px; color: #64748b; border-bottom-left-radius: 19px; border-bottom-right-radius: 19px; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
+  .chat-model-line { flex: 0 0 auto; padding: 8px 14px 12px; font-size: 11px; line-height: 15px; color: #64748b; border-bottom-left-radius: 19px; border-bottom-right-radius: 19px; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
   @keyframes chat-panel-enter { from { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.97); } to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
+  @keyframes chat-panel-exit { from { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } to { opacity: 0; transform: translateX(-50%) translateY(6px) scale(0.97); } }
   @keyframes msg-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .pet-shell {
     position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
@@ -173,9 +280,10 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
     <div class="pet-shell" id="petShell"><div class="sprite" role="img" aria-label="pet"></div></div>
   </div>
   <script>
-    function escapeHtml(value) {
-      return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
-    }
+    ${escapeHtmlText.toString()}
+    ${renderMarkdownText.toString()}
+    const escapeHtml = escapeHtmlText;
+    const renderMarkdown = renderMarkdownText;
     const statusIcons = {
       check: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 6L9 17l-5-5"/></svg>',
       alert: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m21.73 18l-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3M12 9v4m0 4h.01"/></svg>',
@@ -242,10 +350,28 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
     const chatSendBtn = document.getElementById("chatSend");
     const shell = document.getElementById("petShell");
 
+    // Closing is deferred by one animation frame plus the exit duration: the
+    // window shrink is driven by the main process, so if it happens in the same
+    // frame the panel visibly squeezes before disappearing.
+    const CLOSE_ANIM_MS = 150;
+    let closeTimer = null;
     function setChatExpanded(expanded) {
       console.log("[renderer] setChatExpanded", expanded);
-      if (expanded) html.setAttribute("data-chat-expanded", "true");
-      else html.removeAttribute("data-chat-expanded");
+      if (closeTimer !== null) { clearTimeout(closeTimer); closeTimer = null; }
+      if (expanded) {
+        chatPanel.classList.remove("is-closing");
+        html.setAttribute("data-chat-expanded", "true");
+        return;
+      }
+      if (!isChatExpanded()) { chatPanel.classList.remove("is-closing"); return; }
+      // Keep the expanded attribute until the exit animation finishes, so the
+      // panel stays laid out at full height for the fade.
+      chatPanel.classList.add("is-closing");
+      closeTimer = setTimeout(() => {
+        closeTimer = null;
+        chatPanel.classList.remove("is-closing");
+        html.removeAttribute("data-chat-expanded");
+      }, CLOSE_ANIM_MS);
     }
     function isChatExpanded() { return html.getAttribute("data-chat-expanded") === "true"; }
 
@@ -263,7 +389,10 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       wrap.className = "chat-msg is-" + role;
       const bubbleEl = document.createElement("div");
       bubbleEl.className = "chat-msg-bubble";
-      bubbleEl.textContent = text;
+      // Assistant replies are Markdown from the model; the user's own echo is
+      // plain text so their formatting is never reinterpreted.
+      if (role === "assistant") bubbleEl.innerHTML = renderMarkdown(text);
+      else bubbleEl.textContent = text;
       wrap.appendChild(bubbleEl);
       chatTranscript.appendChild(wrap);
       chatTranscript.scrollTop = chatTranscript.scrollHeight;
@@ -314,31 +443,46 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       }).catch((error) => {
         addChatMessage("assistant", "停止失败：" + (error && error.message ? error.message : error));
       }).finally(() => {
+        // Drop anything still queued: the user asked to stop.
+        sendQueue.length = 0;
         setBusy(false);
         chatSendBtn.disabled = false;
         sending = false;
       });
     });
 
+    // While a turn is running the user may keep typing. Messages are queued and
+    // run one after another instead of being dropped, so the CLI never sees two
+    // concurrent turns on the same session.
     let sending = false;
+    const sendQueue = [];
     async function sendCurrentText(explicit) {
       const text = (typeof explicit === "string" ? explicit : chatText.value).trim();
-      console.log("[renderer] sendCurrentText", JSON.stringify(text), "sending=", sending);
-      if (!text || sending) return;
+      console.log("[renderer] sendCurrentText", JSON.stringify(text), "sending=", sending, "queued=", sendQueue.length);
+      if (!text) return;
+      if (typeof explicit !== "string") chatText.value = "";
+      addChatMessage("user", text);
+      sendQueue.push(text);
+      void drainSendQueue();
+    }
+    async function drainSendQueue() {
+      if (sending) return;
       sending = true;
-      chatText.value = "";
       chatSendBtn.disabled = true;
       setBusy(true);
-      addChatMessage("user", text);
       try {
-        if (!window.openpetsDemo || typeof window.openpetsDemo.chatSend !== "function") {
-          throw new Error("preload 未暴露 chatSend（窗口可能未加载 preload）");
+        while (sendQueue.length > 0) {
+          const text = sendQueue.shift();
+          if (!window.openpetsDemo || typeof window.openpetsDemo.chatSend !== "function") {
+            throw new Error("preload 未暴露 chatSend（窗口可能未加载 preload）");
+          }
+          const result = await window.openpetsDemo.chatSend(text);
+          if (result && result.ok && result.reply) addChatMessage("assistant", result.reply);
+          else if (result && result.error) addChatMessage("assistant", result.error);
         }
-        const result = await window.openpetsDemo.chatSend(text);
-        if (result && result.ok && result.reply) addChatMessage("assistant", result.reply);
-        else if (result && result.error) addChatMessage("assistant", result.error);
       } catch (error) {
         addChatMessage("assistant", "发送失败：" + (error && error.message ? error.message : error));
+        sendQueue.length = 0;
       } finally {
         sending = false;
         chatSendBtn.disabled = false;

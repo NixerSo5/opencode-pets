@@ -106,7 +106,7 @@ export interface RunPromptResult {
     readonly reply?: string;
     readonly error?: string;
 }
-/** Kill the in-flight `opencode run`, if any. Resolves true when one was killed. */
+/** Kill every in-flight `opencode run`. Resolves true when at least one was killed. */
 export declare function abortRunPrompt(): boolean;
 export declare function runPrompt(sessionID: string, prompt: string, directory?: string, model?: {
     providerID: string;

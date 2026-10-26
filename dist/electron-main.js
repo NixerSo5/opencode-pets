@@ -505,6 +505,12 @@ function createPetWindow() {
     });
     window.setAlwaysOnTop(true, "floating");
     window.setMenu(null);
+    // Hide the chat panel when the pet window loses focus. `setChatExpanded`
+    // returns early when already collapsed, so this is a no-op most of the time.
+    window.on("blur", () => {
+        if (chatExpanded)
+            setChatExpanded(false);
+    });
     // Pet's own right-click menu: model / new session / switch session / hide.
     window.webContents.on("context-menu", () => {
         void showPetContextMenu();

@@ -223,15 +223,19 @@ function resolveCliPath(): string {
   return cachedCliPath;
 }
 
-/** The CLI child currently serving a turn; Stop kills it. */
-let activeRun: import("node:child_process").ChildProcess | undefined;
+/**
+ * Every CLI child currently serving a turn. This used to be a single slot, but
+ * the panel can queue several prompts; a second spawn would overwrite the first
+ * child, and the first one's `close` handler would then mistake itself for a
+ * cancelled run and drop the reply it had already collected.
+ */
+const activeRuns = new Set<import("node:child_process").ChildProcess>();
 
-/** Kill the in-flight `opencode run`, if any. Resolves true when one was killed. */
+/** Kill every in-flight `opencode run`. Resolves true when at least one was killed. */
 export function abortRunPrompt(): boolean {
-  const child = activeRun;
-  if (child === undefined) return false;
-  activeRun = undefined;
-  child.kill();
+  if (activeRuns.size === 0) return false;
+  for (const child of activeRuns) child.kill();
+  activeRuns.clear();
   return true;
 }
 
@@ -270,7 +274,7 @@ export async function runPrompt(
       resolve({ ok: false, error: `启动 opencode 失败：${error instanceof Error ? error.message : String(error)}` });
       return;
     }
-    activeRun = child;
+    activeRuns.add(child);
     const texts: string[] = [];
     let stderr = "";
     let buffer = "";
@@ -302,12 +306,13 @@ export async function runPrompt(
       }
     });
     child.on("error", (error) => {
-      if (activeRun === child) activeRun = undefined;
+      activeRuns.delete(child);
       resolve({ ok: false, error: `启动 opencode 失败：${error.message}` });
     });
     child.on("close", (code) => {
-      const wasActive = activeRun === child;
-      if (wasActive) activeRun = undefined;
+      // `wasActive` is false only when Stop killed this exact child, not when a
+      // later turn registered another one.
+      const wasActive = activeRuns.delete(child);
       if (buffer.trim().startsWith("{")) drain("\n");
       const reply = texts.join("").trim();
       if (reply.length > 0) resolve({ ok: true, reply });
