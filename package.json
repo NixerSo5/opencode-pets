@@ -1,0 +1,21 @@
+{
+  "name": "pet-animation-standalone",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/electron-main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "app": "electron .",
+    "demo": "node dist/demo.js"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "@types/yauzl": "^3.4.0",
+    "electron": "^42.0.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "yauzl": "^3.4.0"
+  }
+}
