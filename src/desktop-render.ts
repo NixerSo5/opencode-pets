@@ -106,9 +106,15 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-textarea:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2), inset 0 1px 2px rgba(15, 23, 42, 0.03); }
   .chat-textarea::placeholder { color: #94a3b8; }
   .chat-send-btn { width: 36px; height: 36px; border-radius: 10px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(37, 99, 235, 0.28); transition: all 140ms ease; }
+  .chat-stop-btn { width: 36px; height: 36px; border-radius: 10px; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0; cursor: pointer; pointer-events: auto; -webkit-app-region: no-drag; background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%); color: #ffffff; box-shadow: 0 2px 5px rgba(225, 29, 72, 0.28); transition: all 140ms ease; }
+  .chat-stop-btn:hover { background: linear-gradient(135deg, #e11d48 0%, #be123c 100%); box-shadow: 0 3px 8px rgba(225, 29, 72, 0.35); transform: scale(1.02); }
+  .chat-stop-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; box-shadow: none; cursor: not-allowed; transform: none; }
+  .chat-stop-btn svg { width: 13px; height: 13px; }
+  .chat-stop-btn[hidden] { display: none; }
   .chat-send-btn:hover { background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%); box-shadow: 0 3px 8px rgba(37, 99, 235, 0.35); transform: scale(1.02); }
   .chat-send-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; box-shadow: none; cursor: not-allowed; transform: none; }
   .chat-send-btn svg { width: 15px; height: 15px; }
+  .chat-model-line { padding: 0 14px 10px; font-size: 11px; color: #64748b; border-bottom-left-radius: 19px; border-bottom-right-radius: 19px; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
   @keyframes chat-panel-enter { from { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.97); } to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
   @keyframes msg-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .pet-shell {
@@ -154,10 +160,14 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       </div>
       <div class="chat-composer">
         <textarea class="chat-textarea" id="chatText" rows="1" maxlength="2000" placeholder="输入消息…（Enter 发送）"></textarea>
+        <button type="button" class="chat-stop-btn" id="chatStop" title="停止思考" aria-label="停止思考" hidden>
+          <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5" fill="currentColor"/></svg>
+        </button>
         <button type="button" class="chat-send-btn" id="chatSend" title="发送" aria-label="发送">
           <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>
         </button>
       </div>
+      <div class="chat-model-line" id="chatModelLine">当前模型：未绑定</div>
     </div>
     <div class="bubble" id="bubble"></div>
     <div class="pet-shell" id="petShell"><div class="sprite" role="img" aria-label="pet"></div></div>
@@ -233,6 +243,7 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
     const shell = document.getElementById("petShell");
 
     function setChatExpanded(expanded) {
+      console.log("[renderer] setChatExpanded", expanded);
       if (expanded) html.setAttribute("data-chat-expanded", "true");
       else html.removeAttribute("data-chat-expanded");
     }
@@ -272,15 +283,57 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       }
     }
 
+    const chatModelLine = document.getElementById("chatModelLine");
+    async function refreshModelLine() {
+      if (!chatModelLine || typeof window.openpetsDemo?.chatModel !== "function") return;
+      try {
+        const result = await window.openpetsDemo.chatModel();
+        const label = result && typeof result.label === "string" ? result.label : "未知";
+        chatModelLine.textContent = "当前模型：" + label;
+      } catch {
+        chatModelLine.textContent = "当前模型：读取失败";
+      }
+    }
+
+    const chatStopBtn = document.getElementById("chatStop");
+    function setBusy(busy) {
+      chatStopBtn.hidden = !busy;
+      chatStopBtn.disabled = false;
+    }
+    chatStopBtn.addEventListener("click", () => {
+      console.log("[renderer] stop clicked");
+      chatStopBtn.disabled = true;
+      if (!window.openpetsDemo || typeof window.openpetsDemo.chatStop !== "function") {
+        addChatMessage("assistant", "停止失败：preload 未暴露 chatStop");
+        chatStopBtn.disabled = false;
+        return;
+      }
+      Promise.resolve(window.openpetsDemo.chatStop()).then((result) => {
+        if (result && result.ok) addChatMessage("assistant", "已停止思考");
+        else addChatMessage("assistant", "停止失败：" + ((result && result.error) || "未知错误"));
+      }).catch((error) => {
+        addChatMessage("assistant", "停止失败：" + (error && error.message ? error.message : error));
+      }).finally(() => {
+        setBusy(false);
+        chatSendBtn.disabled = false;
+        sending = false;
+      });
+    });
+
     let sending = false;
-    async function sendCurrentText() {
-      const text = chatText.value.trim();
+    async function sendCurrentText(explicit) {
+      const text = (typeof explicit === "string" ? explicit : chatText.value).trim();
+      console.log("[renderer] sendCurrentText", JSON.stringify(text), "sending=", sending);
       if (!text || sending) return;
       sending = true;
       chatText.value = "";
       chatSendBtn.disabled = true;
+      setBusy(true);
       addChatMessage("user", text);
       try {
+        if (!window.openpetsDemo || typeof window.openpetsDemo.chatSend !== "function") {
+          throw new Error("preload 未暴露 chatSend（窗口可能未加载 preload）");
+        }
         const result = await window.openpetsDemo.chatSend(text);
         if (result && result.ok && result.reply) addChatMessage("assistant", result.reply);
         else if (result && result.error) addChatMessage("assistant", result.error);
@@ -289,10 +342,14 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       } finally {
         sending = false;
         chatSendBtn.disabled = false;
+        setBusy(false);
         chatText.focus();
       }
     }
-    chatSendBtn.addEventListener("click", () => { void sendCurrentText(); });
+    chatSendBtn.addEventListener("click", () => {
+      console.log("[renderer] send button clicked");
+      void sendCurrentText();
+    });
     chatText.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
@@ -303,9 +360,17 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
     window.openpetsDemo?.onPanelState((payload) => {
       if (!payload || typeof payload.chatExpanded !== "boolean") return;
       setChatExpanded(payload.chatExpanded);
-      if (payload.chatExpanded) void loadChatHistory();
+      if (payload.chatExpanded) {
+        void loadChatHistory();
+        void refreshModelLine();
+      }
     });
-    if (isChatExpanded()) void loadChatHistory();
+    if (isChatExpanded()) {
+      void loadChatHistory();
+      void refreshModelLine();
+    }
+    // Exposed for manual smoke tests from DevTools: __openpetsSend("hello").
+    window.__openpetsSend = (text) => sendCurrentText(text);
 
     // Pointer logic: a short, still press on the pet toggles the chat; moving
     // the pointer past a small threshold turns it into a window drag and
@@ -344,7 +409,10 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       }
     }
     shell.addEventListener("pointerup", endPress);
-    shell.addEventListener("pointercancel", () => { press = null; });
+    // Pointer capture on a transparent window can swallow the pointerup that
+    // should land on the shell, so listen on the document as a fallback.
+    document.addEventListener("pointerup", endPress);
+    document.addEventListener("pointercancel", endPress);
   </script>
 </body>
 </html>`;

@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld("openpetsDemo", {
   chatHistory: () => {
     return ipcRenderer.invoke("openpets:pet-chat-history");
   },
+  chatStop: () => {
+    return ipcRenderer.invoke("openpets:pet-chat-stop");
+  },
+  chatModel: () => {
+    return ipcRenderer.invoke("openpets:pet-chat-model");
+  },
   dragMove: (dx, dy) => {
     ipcRenderer.send("openpets:pet-drag-move", { dx, dy });
   },

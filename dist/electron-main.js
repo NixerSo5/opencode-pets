@@ -16,9 +16,9 @@ import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
 import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, } from "./pet-store.js";
 import { pickReactionMessage } from "./reaction-messages.js";
-import { createSession, discoverService, interruptSession, readTimeline, sendPrompt, } from "./opencode-client.js";
+import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, readTimeline, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
-import { parseSummonRequest, placeAtCursor } from "./summon.js";
+import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
 // Reaction schedule mirroring the original `reactionAnimationMetadata` order
 // (advanced manually via the tray "切换下一个表情"; no automatic polling).
@@ -202,12 +202,25 @@ async function attachSession(directory) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
     }
 }
+/** Interrupt the session's agent loop; throws when the server rejects it. */
+async function requestInterrupt(target, sessionID) {
+    const response = await fetch(`${target.url}/api/session/${encodeURIComponent(sessionID)}/interrupt`, {
+        method: "POST",
+        headers: {
+            authorization: `Basic ${Buffer.from(`opencode:${target.password}`).toString("base64")}`,
+            "content-type": "application/json",
+        },
+        body: "{}",
+    });
+    if (!response.ok)
+        throw new Error(`停止失败：HTTP ${response.status}`);
+}
 /**
  * Wait for the agent to answer a prompt we just sent, then return the newest
  * assistant text. Polls the projected transcript until a new assistant row
  * appears after `promptText`, or the timeout expires.
  */
-async function followReply(target, sessionID, promptText, timeoutMs = 120_000) {
+async function followReply(target, sessionID, promptText, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     let sawUser = false;
     while (Date.now() < deadline) {
@@ -215,13 +228,46 @@ async function followReply(target, sessionID, promptText, timeoutMs = 120_000) {
         const timeline = await readTimeline(target, sessionID).catch(() => undefined);
         if (timeline === undefined)
             continue;
+        let userIndex = -1;
+        for (let i = timeline.length - 1; i >= 0; i -= 1) {
+            const entry = timeline[i];
+            if (entry !== undefined && entry.role === "user" && entry.text.includes(promptText)) {
+                userIndex = i;
+                break;
+            }
+        }
+        if (userIndex >= 0)
+            sawUser = true;
         if (!sawUser)
-            sawUser = timeline.some((entry) => entry.role === "user" && entry.text.includes(promptText));
-        const last = timeline.at(-1);
-        if (sawUser && last !== undefined && last.role === "assistant")
-            return { ok: true, reply: last.text };
+            continue;
+        // Only look at rows produced after our prompt: earlier turns (including
+        // their failures) must not be mistaken for the answer to this one.
+        const since = userIndex >= 0 ? timeline.slice(userIndex + 1) : [];
+        const failure = since.find((entry) => entry.error !== undefined);
+        if (failure !== undefined) {
+            return { ok: false, error: `OpenCode 报错：${failure.error ?? "未知错误"}` };
+        }
+        let answer;
+        for (const entry of since) {
+            if (entry.role === "assistant" && entry.text.trim().length > 0)
+                answer = entry;
+        }
+        if (answer !== undefined)
+            return { ok: true, reply: answer.text };
     }
-    return { ok: false, error: "等待 OpenCode 回复超时" };
+    return { ok: false, error: "30 秒内没等到回复，OpenCode 可能还在生成；稍后可在面板历史里看到结果" };
+}
+/**
+ * Bind a session without moving the window, used on plain launch so the chat
+ * panel works even when the pet was not summoned from Explorer. Silent on
+ * failure: the user only learns about it when they try to send a message.
+ */
+async function connectDefault() {
+    const result = await attachSession(desktopDirectory());
+    if (result.ok && activeSessionTitle !== undefined)
+        say(`${activeSessionTitle} · 已连接`);
+    else
+        console.log(`[opencode] startup connect failed: ${result.message ?? "unknown"}`);
 }
 /**
  * Execute a pending summon: attach a session for the requested folder, place
@@ -244,6 +290,7 @@ async function runSummon(request) {
 }
 /** Expand/collapse the pet window carrier for the chat panel (anchors the pet in place). */
 function setChatExpanded(next) {
+    console.log(`[pet] setChatExpanded next=${next} current=${chatExpanded}`);
     if (chatExpanded === next)
         return;
     const win = mainWindow;
@@ -269,6 +316,7 @@ function setChatExpanded(next) {
     finally {
         win.setResizable(wasResizable);
     }
+    console.log(`[pet] chat bounds now ${JSON.stringify(win.getBounds())}`);
     publishPanelState();
 }
 // The 5s reaction polling loop (表情轮询) was removed per product request:
@@ -297,6 +345,132 @@ function bottomRightPosition(width, height) {
         x: display.x + display.width - width - 24,
         y: display.y + display.height - height - 8,
     };
+}
+/**
+ * Show the pet's own right-click menu. Items are built lazily so model and
+ * session lists always reflect the live server state.
+ */
+async function showPetContextMenu() {
+    const win = mainWindow;
+    if (win === null || win.isDestroyed())
+        return;
+    const target = endpoint ?? (await discoverService());
+    if (target !== undefined)
+        endpoint = target;
+    const modelItems = [];
+    const sessionItems = [];
+    if (target === undefined) {
+        modelItems.push({ label: "OpenCode 未连接", enabled: false });
+        sessionItems.push({ label: "OpenCode 未连接", enabled: false });
+    }
+    else {
+        const models = await listModels(target).catch(() => undefined);
+        if (models === undefined) {
+            modelItems.push({ label: "读取模型列表失败", enabled: false });
+        }
+        else if (models.length === 0) {
+            modelItems.push({ label: "没有可用模型", enabled: false });
+        }
+        else {
+            const current = await getSession(target, activeSessionID ?? "").catch(() => undefined);
+            const currentModel = current?.model;
+            for (const model of models) {
+                const checked = currentModel !== undefined && currentModel.providerID === model.providerID && currentModel.id === model.id;
+                modelItems.push({
+                    label: `${model.name} (${model.providerID})`,
+                    type: "checkbox",
+                    checked,
+                    click: () => {
+                        void (async () => {
+                            if (activeSessionID === undefined) {
+                                say("还没有绑定会话");
+                                return;
+                            }
+                            try {
+                                console.log(`[model] switch session=${activeSessionID} -> ${model.providerID}/${model.id}`);
+                                await setSessionModel(target, activeSessionID, { providerID: model.providerID, id: model.id });
+                                // Do not read the session back here: `ModelSelected` is projected
+                                // asynchronously, so a 204 is followed by a short window where the
+                                // row still holds the previous model. The switch itself is the
+                                // confirmation; the panel refreshes from the server on next open.
+                                console.log(`[model] switched session=${activeSessionID}`);
+                                // Confirm the switch took effect before the panel re-reads it.
+                                // The projection lands asynchronously; this waits for it.
+                                const confirmed = await getSessionAfterModelSwitch(target, activeSessionID, {
+                                    providerID: model.providerID,
+                                    id: model.id,
+                                }).catch(() => undefined);
+                                console.log(`[model] confirmed=${confirmed?.model ? confirmed.model.providerID + "/" + confirmed.model.id : "null"} session=${activeSessionID}`);
+                                say(`模型已切换：${model.name}`);
+                                if (chatExpanded)
+                                    mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+                            }
+                            catch (error) {
+                                say(`切换模型失败：${error instanceof Error ? error.message : String(error)}`);
+                            }
+                        })();
+                    },
+                });
+            }
+        }
+        const sessions = await listSessions(target).catch(() => undefined);
+        if (sessions === undefined) {
+            sessionItems.push({ label: "读取会话列表失败", enabled: false });
+        }
+        else if (sessions.length === 0) {
+            sessionItems.push({ label: "没有会话", enabled: false });
+        }
+        else {
+            for (const session of sessions.slice(0, 20)) {
+                const directory = session.location?.directory ?? "";
+                sessionItems.push({
+                    label: `${session.title ?? session.id} — ${basename(directory) || "?"}`,
+                    type: "radio",
+                    checked: session.id === activeSessionID,
+                    click: () => {
+                        activeSessionID = session.id;
+                        activeSessionTitle = session.title ?? sessionLabel(directory);
+                        watch?.track({ id: session.id, title: activeSessionTitle, directory });
+                        say(`已切换会话：${activeSessionTitle}`);
+                        if (chatExpanded)
+                            mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+                    },
+                });
+            }
+        }
+    }
+    const menu = Menu.buildFromTemplate([
+        { label: "选择 model", submenu: modelItems },
+        {
+            label: "新建 session",
+            click: () => {
+                void (async () => {
+                    const directory = watch?.get(activeSessionID ?? "")?.directory ?? desktopDirectory();
+                    try {
+                        const discovered = await discoverService();
+                        if (discovered === undefined) {
+                            say("OpenCode 未连接");
+                            return;
+                        }
+                        endpoint = discovered;
+                        startWatch();
+                        const session = await createSession(discovered, directory, sessionLabel(directory));
+                        activeSessionID = session.id;
+                        activeSessionTitle = session.title ?? sessionLabel(directory);
+                        watch?.track({ id: session.id, title: activeSessionTitle, directory });
+                        say(`已新建会话：${activeSessionTitle}`);
+                    }
+                    catch (error) {
+                        say(`新建会话失败：${error instanceof Error ? error.message : String(error)}`);
+                    }
+                })();
+            },
+        },
+        { label: "选择 session", submenu: sessionItems },
+        { type: "separator" },
+        { label: "关闭宠物", click: () => { win.hide(); } },
+    ]);
+    menu.popup({ window: win });
 }
 function createPetWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -331,6 +505,15 @@ function createPetWindow() {
     });
     window.setAlwaysOnTop(true, "floating");
     window.setMenu(null);
+    // Pet's own right-click menu: model / new session / switch session / hide.
+    window.webContents.on("context-menu", () => {
+        void showPetContextMenu();
+    });
+    // Forward renderer console output to the main process stdout so the chat
+    // panel interactions can be diagnosed from the terminal.
+    window.webContents.on("console-message", (_event, level, message) => {
+        console.log(`[renderer:${level}] ${message}`);
+    });
     // Re-show the welcome greeting whenever the pet page loads (startup and
     // every later reload, e.g. switching the default pet).
     window.webContents.on("did-finish-load", () => {
@@ -367,6 +550,30 @@ function createTray() {
             label: "切换下一个表情",
             type: "normal",
             click: () => advanceSchedule(),
+        },
+        {
+            // Diagnostic path: exercises prompt + followReply without the renderer.
+            label: "测试发送 123",
+            type: "normal",
+            click: () => {
+                void (async () => {
+                    console.log(`[diag] tray send start endpoint=${String(endpoint)} session=${String(activeSessionID)}`);
+                    if (endpoint === undefined || activeSessionID === undefined) {
+                        console.log("[diag] tray send aborted: not connected");
+                        return;
+                    }
+                    try {
+                        await sendPrompt(endpoint, activeSessionID, "123");
+                        console.log("[diag] tray sendPrompt ok");
+                    }
+                    catch (error) {
+                        console.log(`[diag] tray sendPrompt failed: ${error instanceof Error ? error.message : String(error)}`);
+                        return;
+                    }
+                    const reply = await followReply(endpoint, activeSessionID, "123").catch((error) => ({ ok: false, error: String(error) }));
+                    console.log(`[diag] tray reply ${JSON.stringify(reply).slice(0, 400)}`);
+                })();
+            },
         },
         { label: "退出", type: "normal", click: () => app.quit() },
     ]));
@@ -460,24 +667,49 @@ function installIpc() {
             return { ok: false, error: "读取会话历史失败", messages: [] };
         return { ok: true, sessionTitle: activeSessionTitle ?? "", messages };
     });
+    // The chat panel shows the model the bound session actually runs on, so the
+    // user can tell whether a switch took effect without opening OpenCode.
+    ipcMain.handle("openpets:pet-chat-model", async () => {
+        if (endpoint === undefined)
+            return { ok: false, label: "OpenCode 未连接" };
+        if (activeSessionID === undefined)
+            return { ok: false, label: "未绑定会话" };
+        const session = await getSession(endpoint, activeSessionID).catch(() => undefined);
+        const model = session?.model;
+        if (model === undefined)
+            return { ok: true, label: "默认模型（会话未指定）" };
+        return { ok: true, label: `${model.providerID}/${model.id}` };
+    });
     ipcMain.handle("openpets:pet-chat-send", async (_event, raw) => {
         const text = typeof raw === "string" ? raw.trim() : "";
         if (!text)
             return { ok: false, error: "消息为空" };
         if (text.length > 4000)
             return { ok: false, error: "消息太长（上限 4000 字）" };
-        if (endpoint === undefined)
-            return { ok: false, error: "OpenCode 未连接，请先右键召唤宠物" };
         if (activeSessionID === undefined)
-            return { ok: false, error: "当前宠物还没有绑定会话" };
-        try {
-            await sendPrompt(endpoint, activeSessionID, text);
+            return { ok: false, error: "当前宠物还没有绑定会话，请稍候或重新召唤" };
+        // Run the turn through the real CLI, exactly like the user does in a
+        // terminal. The v2 HTTP `prompt` endpoint only steers a running agent, so
+        // it never starts a turn on an idle session.
+        const directory = watch?.get(activeSessionID)?.directory;
+        // Mirror OpenCode's own session model into the CLI invocation; the session
+        // is the source of truth, so a model the user picked in OpenCode (or in
+        // the pet's context menu) is the one this turn runs on.
+        const session = endpoint === undefined ? undefined : await getSession(endpoint, activeSessionID).catch(() => undefined);
+        const model = session?.model;
+        return await runPrompt(activeSessionID, text, directory, model === undefined ? undefined : { providerID: model.providerID, id: model.id });
+    });
+    // User-initiated "stop thinking": kill the CLI turn this pet started, and
+    // also interrupt the server-side loop in case it already took the prompt.
+    // The session stays bound and usable afterwards.
+    ipcMain.handle("openpets:pet-chat-stop", async () => {
+        const killedLocal = abortRunPrompt();
+        if (endpoint !== undefined && activeSessionID !== undefined) {
+            await requestInterrupt(endpoint, activeSessionID).catch(() => undefined);
         }
-        catch (error) {
-            return { ok: false, error: error instanceof Error ? error.message : String(error) };
-        }
-        // Follow the reply in the transcript; polling stops once the agent idles.
-        return await followReply(endpoint, activeSessionID, text);
+        if (!killedLocal)
+            return { ok: false, error: "当前没有进行中的回复" };
+        return { ok: true };
     });
     ipcMain.on("openpets:pet-drag-move", (_event, payload) => {
         const win = mainWindow;
@@ -574,6 +806,11 @@ void app.whenReady().then(async () => {
     if (startupSummon !== undefined)
         pendingSummon = startupSummon;
     createPetWindow();
+    // Connect on plain launch too: the pet is useful without a context-menu
+    // summon, so bind a session for the default folder right away. A startup
+    // summon already queued its own attach inside runSummon and wins here.
+    if (startupSummon === undefined)
+        void connectDefault();
 });
 app.on("window-all-closed", () => {
     // The pet window is the app; closing it exits like quitting the pet.
