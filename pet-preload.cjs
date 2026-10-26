@@ -28,6 +28,9 @@ contextBridge.exposeInMainWorld("openpetsDemo", {
   chatSend: (text) => {
     return ipcRenderer.invoke("openpets:pet-chat-send", text);
   },
+  chatHistory: () => {
+    return ipcRenderer.invoke("openpets:pet-chat-history");
+  },
   dragMove: (dx, dy) => {
     ipcRenderer.send("openpets:pet-drag-move", { dx, dy });
   },

@@ -7,7 +7,7 @@
  */
 import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog } from "electron";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createPetPageHtml } from "./desktop-render.js";
 import { getConfiguredSpriteStates, isLoopingSpriteState, resolveReactionSpriteState } from "./reaction-animation-mapping.js";
@@ -16,6 +16,9 @@ import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
 import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, } from "./pet-store.js";
 import { pickReactionMessage } from "./reaction-messages.js";
+import { createSession, discoverService, interruptSession, readTimeline, sendPrompt, } from "./opencode-client.js";
+import { OpenCodeWatch } from "./opencode-watch.js";
+import { parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
 // Reaction schedule mirroring the original `reactionAnimationMetadata` order
 // (advanced manually via the tray "切换下一个表情"; no automatic polling).
@@ -33,6 +36,12 @@ let currentPetEntry = { ...builtInPetEntry, spritesheetPath: "", builtIn: true }
 /** Chat carrier state (original expandedPetWindowSize behavior). */
 let chatExpanded = false;
 let collapsedAnchor = null;
+/** OpenCode wiring: one pet window, one session (milestone 1). */
+let endpoint;
+let activeSessionID;
+let activeSessionTitle;
+let watch;
+let pendingSummon;
 const collapsedWindowSize = { width: 320, height: 300 };
 const expandedWindowSize = { width: 420, height: 640 };
 const distDir = dirname(fileURLToPath(import.meta.url));
@@ -103,6 +112,135 @@ function expandedBoundsFor(collapsed) {
 }
 function publishPanelState() {
     mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+}
+/** Human-readable pet label for a session, e.g. "my-project". */
+function sessionLabel(directory) {
+    const name = basename(directory);
+    return name.length > 0 ? name : directory;
+}
+/** Push a plain message to the pet bubble without changing its pose. */
+function say(text) {
+    mainWindow?.webContents.send("openpets:pet-state", { state: lastSpriteState, message: text });
+}
+/**
+ * Map OpenCode session events onto pet reactions. Only the session this pet
+ * owns is animated, so a busy TUI session elsewhere stays invisible here.
+ */
+function handleWatchStatus(update) {
+    if (activeSessionID === undefined || update.sessionID !== activeSessionID)
+        return;
+    const label = activeSessionTitle ?? "session";
+    switch (update.kind) {
+        case "enqueued":
+            applyReaction("waving", `${label}: 收到你的消息`);
+            return;
+        case "started":
+            applyReaction(update.tool === undefined ? "working" : "running", update.tool === undefined ? undefined : `${label}: ${update.tool}`);
+            return;
+        case "succeeded":
+            applyReaction("success", `${label}: 完成`);
+            return;
+        case "failed":
+            applyReaction("error", `${label}: 失败`);
+            return;
+        case "interrupted":
+            applyReaction("idle", `${label}: 已中断`);
+            return;
+        case "waiting":
+            applyReaction("waiting", update.tool === undefined ? `${label}: 需要你批准` : `${label}: 等你批准 ${update.tool}`);
+            return;
+    }
+}
+/** Start the SSE watcher once; it reconnects on its own afterwards. */
+function startWatch() {
+    if (watch !== undefined)
+        return;
+    watch = new OpenCodeWatch({
+        onStatus: handleWatchStatus,
+        onEvent: (event) => {
+            // The step/text events are high-frequency; only surface the ones that
+            // give the pet something meaningful to say, and only for its session.
+            if (activeSessionID === undefined || event.sessionID !== activeSessionID)
+                return;
+            if (event.type === "session.step.started")
+                applyReaction("thinking", "想了想下一步");
+            if (event.type === "session.step.ended")
+                applyReaction("working", "推进了一步");
+        },
+        onConnected: () => console.log("[opencode] SSE connected"),
+        onDisconnected: (reason) => {
+            console.log(`[opencode] SSE disconnected: ${reason}`);
+            if (activeSessionID !== undefined)
+                say("OpenCode 连接断开，正在重连…");
+        },
+    });
+    watch.start();
+}
+/**
+ * Attach the pet to an OpenCode session for `directory`: reuse the current one
+ * when it already points at the same folder, otherwise create a fresh session.
+ */
+async function attachSession(directory) {
+    const discovered = await discoverService();
+    if (discovered === undefined)
+        return { ok: false, message: "没找到正在运行的 OpenCode 服务（service.json 缺失）" };
+    endpoint = discovered;
+    startWatch();
+    if (activeSessionID !== undefined) {
+        const state = watch?.get(activeSessionID);
+        if (state?.directory === directory)
+            return { ok: true, message: `沿用会话：${activeSessionTitle ?? ""}` };
+    }
+    try {
+        const session = await createSession(discovered, directory, sessionLabel(directory));
+        activeSessionID = session.id;
+        activeSessionTitle = session.title ?? sessionLabel(directory);
+        watch?.track({ id: session.id, title: activeSessionTitle, directory });
+        return { ok: true, message: `已创建会话：${activeSessionTitle}` };
+    }
+    catch (error) {
+        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+}
+/**
+ * Wait for the agent to answer a prompt we just sent, then return the newest
+ * assistant text. Polls the projected transcript until a new assistant row
+ * appears after `promptText`, or the timeout expires.
+ */
+async function followReply(target, sessionID, promptText, timeoutMs = 120_000) {
+    const deadline = Date.now() + timeoutMs;
+    let sawUser = false;
+    while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        const timeline = await readTimeline(target, sessionID).catch(() => undefined);
+        if (timeline === undefined)
+            continue;
+        if (!sawUser)
+            sawUser = timeline.some((entry) => entry.role === "user" && entry.text.includes(promptText));
+        const last = timeline.at(-1);
+        if (sawUser && last !== undefined && last.role === "assistant")
+            return { ok: true, reply: last.text };
+    }
+    return { ok: false, error: "等待 OpenCode 回复超时" };
+}
+/**
+ * Execute a pending summon: attach a session for the requested folder, place
+ * the pet at the cursor and greet. Safe to call again on second-instance.
+ */
+async function runSummon(request) {
+    pendingSummon = undefined;
+    const win = mainWindow;
+    if (win !== null && !win.isDestroyed()) {
+        const area = screen.getDisplayNearestPoint({ x: request.x ?? 0, y: request.y ?? 0 }).workArea;
+        const placed = placeAtCursor(request, area, collapsedWindowSize);
+        win.setPosition(placed.x, placed.y);
+        if (!win.isVisible())
+            win.show();
+        win.focus();
+    }
+    sayWelcome();
+    const result = await attachSession(request.directory);
+    say(result.ok ? `${sessionLabel(request.directory)} · ${result.message ?? ""}` : `召唤失败：${result.message ?? "未知错误"}`);
 }
 /** Expand/collapse the pet window carrier for the chat panel (anchors the pet in place). */
 function setChatExpanded(next) {
@@ -208,6 +346,12 @@ function createPetWindow() {
     window.on("closed", () => {
         mainWindow = null;
     });
+    const queued = pendingSummon;
+    if (queued !== undefined) {
+        window.webContents.once("did-finish-load", () => {
+            void runSummon(queued);
+        });
+    }
 }
 function createTray() {
     const icon = nativeImage.createFromPath(trayIconPath);
@@ -304,15 +448,36 @@ function installIpc() {
     ipcMain.on("openpets:pet-chat-toggle", () => {
         setChatExpanded(!chatExpanded);
     });
+    // Full projected transcript for the bound session, oldest first. The panel
+    // calls this on open so the first paint shows real OpenCode history.
+    ipcMain.handle("openpets:pet-chat-history", async () => {
+        if (endpoint === undefined)
+            return { ok: false, error: "OpenCode 未连接", messages: [] };
+        if (activeSessionID === undefined)
+            return { ok: false, error: "当前宠物还没有绑定会话", messages: [] };
+        const messages = await readTimeline(endpoint, activeSessionID).catch(() => undefined);
+        if (messages === undefined)
+            return { ok: false, error: "读取会话历史失败", messages: [] };
+        return { ok: true, sessionTitle: activeSessionTitle ?? "", messages };
+    });
     ipcMain.handle("openpets:pet-chat-send", async (_event, raw) => {
         const text = typeof raw === "string" ? raw.trim() : "";
         if (!text)
             return { ok: false, error: "消息为空" };
         if (text.length > 4000)
             return { ok: false, error: "消息太长（上限 4000 字）" };
-        // Stub assistant reply until the OpenCode session backend is wired in.
-        await new Promise((resolve) => setTimeout(resolve, 450));
-        return { ok: true, reply: `收到：「${text}」。现在还是演示回复——接入 OpenCode 会话后，这里就是真实回答。` };
+        if (endpoint === undefined)
+            return { ok: false, error: "OpenCode 未连接，请先右键召唤宠物" };
+        if (activeSessionID === undefined)
+            return { ok: false, error: "当前宠物还没有绑定会话" };
+        try {
+            await sendPrompt(endpoint, activeSessionID, text);
+        }
+        catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+        // Follow the reply in the transcript; polling stops once the agent idles.
+        return await followReply(endpoint, activeSessionID, text);
     });
     ipcMain.on("openpets:pet-drag-move", (_event, payload) => {
         const win = mainWindow;
@@ -375,10 +540,39 @@ function installIpc() {
         return importPetFolder(app.getPath("userData"), result.filePaths[0]);
     });
 }
+/** Handle a summon request, waiting for the pet window to exist if needed. */
+function dispatchSummon(request) {
+    if (mainWindow === null || mainWindow.isDestroyed()) {
+        pendingSummon = request;
+        createPetWindow();
+        return;
+    }
+    void runSummon(request);
+}
+// Explorer invokes one process per click; a second launch forwards its request
+// to the running instance instead of stacking duplicate pets.
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) {
+    app.quit();
+}
+else {
+    app.on("second-instance", (_event, argv) => {
+        const request = parseSummonRequest(argv);
+        if (request === undefined) {
+            mainWindow?.show();
+            mainWindow?.focus();
+            return;
+        }
+        dispatchSummon(request);
+    });
+}
 void app.whenReady().then(async () => {
     installIpc();
     currentPetEntry = await resolveDefaultPet(app.getPath("userData"));
     createTray();
+    const startupSummon = parseSummonRequest(process.argv);
+    if (startupSummon !== undefined)
+        pendingSummon = startupSummon;
     createPetWindow();
 });
 app.on("window-all-closed", () => {
@@ -388,4 +582,12 @@ app.on("window-all-closed", () => {
 app.on("quit", () => {
     if (revertTimer)
         clearTimeout(revertTimer);
+    watch?.stop();
+    // Quitting the pet ends its session's running work, per product decision.
+    if (endpoint !== undefined && activeSessionID !== undefined) {
+        void interruptSession(endpoint, activeSessionIdOrEmpty());
+    }
 });
+function activeSessionIdOrEmpty() {
+    return activeSessionID ?? "";
+}

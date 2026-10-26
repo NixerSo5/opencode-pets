@@ -222,7 +222,15 @@ export function createPetPageHtml(options = {}) {
     }
     function isChatExpanded() { return html.getAttribute("data-chat-expanded") === "true"; }
 
-    function addChatMessage(role, text) {
+    // Rendered rows keyed by message id, so a history refresh (on panel open)
+    // and the reply appended by sendCurrentText never duplicate each other.
+    const renderedMessageIds = new Set();
+
+    function addChatMessage(role, text, id) {
+      if (id !== undefined) {
+        if (renderedMessageIds.has(id)) return;
+        renderedMessageIds.add(id);
+      }
       chatEmpty.style.display = "none";
       const wrap = document.createElement("div");
       wrap.className = "chat-msg is-" + role;
@@ -232,6 +240,20 @@ export function createPetPageHtml(options = {}) {
       wrap.appendChild(bubbleEl);
       chatTranscript.appendChild(wrap);
       chatTranscript.scrollTop = chatTranscript.scrollHeight;
+    }
+
+    let loadingHistory = false;
+    async function loadChatHistory() {
+      if (loadingHistory || !window.openpetsDemo?.chatHistory) return;
+      loadingHistory = true;
+      try {
+        const result = await window.openpetsDemo.chatHistory();
+        for (const entry of (result && result.messages) || []) {
+          if (entry && (entry.role === "user" || entry.role === "assistant")) addChatMessage(entry.role, entry.text, entry.id);
+        }
+      } catch { /* history is best-effort; sending still works */ } finally {
+        loadingHistory = false;
+      }
     }
 
     let sending = false;
@@ -263,8 +285,11 @@ export function createPetPageHtml(options = {}) {
     });
     document.getElementById("chatClose").addEventListener("click", () => setChatExpanded(false));
     window.openpetsDemo?.onPanelState((payload) => {
-      if (payload && typeof payload.chatExpanded === "boolean") setChatExpanded(payload.chatExpanded);
+      if (!payload || typeof payload.chatExpanded !== "boolean") return;
+      setChatExpanded(payload.chatExpanded);
+      if (payload.chatExpanded) void loadChatHistory();
     });
+    if (isChatExpanded()) void loadChatHistory();
 
     // Pointer logic: a short, still press on the pet toggles the chat; moving
     // the pointer past a small threshold turns it into a window drag and
