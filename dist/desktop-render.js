@@ -20,6 +20,34 @@ function escapeHtmlText(value) {
         .replaceAll("'", "&#39;");
 }
 /**
+ * Lightweight, language-agnostic syntax highlighting for fenced code blocks.
+ * `escaped` must already be HTML-escaped: this only inserts <span> tags around
+ * tokens, never raw text. Kept at module scope because the regex literals below
+ * contain backslashes that the page template string would eat.
+ *
+ * Strategy: string and comment spans are stashed behind placeholders before the
+ * keyword/number passes run, so a keyword inside a string is not recoloured.
+ */
+function highlightCodeText(escaped) {
+    const stash = [];
+    const keep = (html) => {
+        stash.push(html);
+        return "\u0000HK" + (stash.length - 1) + "\u0000";
+    };
+    // Strings first: single quotes, double quotes and template literals. The input
+    // is HTML-escaped, so quotes appear as &quot; and &#39;.
+    let out = escaped.replace(/(&quot;(?:[^&]|&(?!quot;))*&quot;|&#39;(?:[^&]|&(?!#39;))*&#39;)/g, (m) => keep('<span class="tok-str">' + m + "</span>"));
+    // Comments: line comments for // and #, plus block comments.
+    out = out.replace(/((?:\/\/|#)[^\n]*|\/\*[\s\S]*?\*\/)/g, (m) => keep('<span class="tok-comment">' + m + "</span>"));
+    // Keywords.
+    const keywords = new RegExp("\\b(?:const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|class|extends|import|export|from|default|async|await|try|catch|finally|throw|typeof|instanceof|in|of|this|super|void|delete|yield|static|public|private|protected|interface|type|enum|namespace|implements|readonly|as|def|elif|lambda|pass|raise|with|None|True|False|null|undefined|true|false)\\b", "g");
+    out = out.replace(keywords, (m) => '<span class="tok-kw">' + m + "</span>");
+    // Numbers.
+    out = out.replace(/\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b/g, (m) => '<span class="tok-num">' + m + "</span>");
+    // Restore stashed spans.
+    return out.replace(/\u0000HK(\d+)\u0000/g, (_m, index) => stash[Number(index)] ?? "");
+}
+/**
  * Minimal Markdown renderer for assistant replies. Lives outside the page
  * template on purpose: its regex literals contain backslashes and backticks
  * that a template string would mangle. Injected with toString().
@@ -32,7 +60,7 @@ function renderMarkdownText(source) {
     const codeRe = new RegExp(tick + "([^" + tick + "\\n]+)" + tick, "g");
     let text = String(source ?? "").replace(/\r\n?/g, "\n");
     text = text.replace(fenceRe, (_m, _lang, code) => {
-        fences.push('<pre class="md-pre"><code>' + escape(code.replace(/\n$/, "")) + "</code></pre>");
+        fences.push('<pre class="md-pre"><code>' + highlightCodeText(escape(code.replace(/\n$/, ""))) + "</code></pre>");
         return "%%OPENPETS_FENCE" + (fences.length - 1) + "%%";
     });
     const inline = (value) => value
@@ -156,9 +184,6 @@ export function createPetPageHtml(options = {}) {
   /* --- Chat panel (ported from pet-window-styles.ts In-Pet Attached Chat Panel) --- */
   .openpets-chat-panel { position: absolute; bottom: ${shellHeight + 18}px; left: 50%; transform: translateX(-50%); transform-origin: 50% 100%; width: 390px; height: 500px; max-height: calc(100vh - ${shellHeight + 26}px); z-index: 100; box-sizing: border-box; display: none; flex-direction: column; overflow: hidden; background: linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(240, 245, 255, 0.96) 55%, rgba(237, 233, 254, 0.95) 100%); color: #0f172a; border: 1px solid rgba(226, 232, 240, 0.95); border-radius: 20px; box-shadow: 0 24px 48px -12px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 1); overflow: visible; font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif; pointer-events: auto; -webkit-app-region: no-drag; opacity: 0; color-scheme: light; }
   html[data-chat-expanded="true"] .openpets-chat-panel { display: flex; opacity: 1; animation: chat-panel-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-  /* Collapsing: keep the panel painted while it plays out, so the window can
-     shrink only after the fade finishes (avoids the one-frame squeeze). */
-  .openpets-chat-panel.is-closing { display: flex; animation: chat-panel-exit 150ms ease-in forwards; }
   .openpets-chat-panel::after { content: ""; position: absolute; left: 50%; bottom: -6px; width: 12px; height: 12px; background: #ede9fe; border-right: 1px solid rgba(226, 232, 240, 0.95); border-bottom: 1px solid rgba(226, 232, 240, 0.95); border-bottom-right-radius: 3px; transform: translateX(-50%) rotate(45deg); box-shadow: 3px 3px 6px rgba(15, 23, 42, 0.08); z-index: 1; }
   .chat-header { height: 46px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(226, 232, 240, 0.9); border-top-left-radius: 19px; border-top-right-radius: 19px; background: rgba(248, 250, 252, 0.8); flex-shrink: 0; user-select: none; }
   .chat-header-left { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -190,6 +215,10 @@ export function createPetPageHtml(options = {}) {
   .chat-msg-bubble .md-code { padding: 1px 4px; border-radius: 4px; background: rgba(148, 163, 184, 0.18); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; }
   .chat-msg-bubble .md-pre { margin: 0 0 7px; padding: 8px 10px; border-radius: 8px; background: #0f172a; color: #e2e8f0; overflow-x: auto; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; line-height: 1.5; }
   .chat-msg-bubble .md-pre code { font: inherit; white-space: pre; }
+  .chat-msg-bubble .md-pre .tok-kw { color: #c792ea; }
+  .chat-msg-bubble .md-pre .tok-str { color: #c3e88d; }
+  .chat-msg-bubble .md-pre .tok-comment { color: #7f8c98; font-style: italic; }
+  .chat-msg-bubble .md-pre .tok-num { color: #f78c6c; }
   .chat-composer { padding: 10px 14px 8px; border-top: 1px solid rgba(226, 232, 240, 0.9); background: rgba(248, 250, 252, 0.85); display: flex; align-items: flex-end; gap: 8px; flex: 0 0 auto; }
   .chat-textarea { flex: 1 1 auto; min-width: 0; min-height: 46px; max-height: 132px; padding: 11px 13px; box-sizing: border-box; border: 1px solid rgba(203, 213, 225, 0.9); border-radius: 12px; background: #ffffff; color: #0f172a; font-family: inherit; font-size: 13.5px; line-height: 20px; resize: none; outline: none; pointer-events: auto; -webkit-app-region: no-drag; box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.03); transition: border-color 140ms ease, box-shadow 140ms ease; }
   .chat-textarea:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2), inset 0 1px 2px rgba(15, 23, 42, 0.03); }
@@ -205,7 +234,6 @@ export function createPetPageHtml(options = {}) {
   .chat-send-btn svg { width: 15px; height: 15px; }
   .chat-model-line { flex: 0 0 auto; padding: 8px 14px 12px; font-size: 11px; line-height: 15px; color: #64748b; border-bottom-left-radius: 19px; border-bottom-right-radius: 19px; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
   @keyframes chat-panel-enter { from { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.97); } to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
-  @keyframes chat-panel-exit { from { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } to { opacity: 0; transform: translateX(-50%) translateY(6px) scale(0.97); } }
   @keyframes msg-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .pet-shell {
     position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%);
@@ -264,6 +292,7 @@ export function createPetPageHtml(options = {}) {
   </div>
   <script>
     ${escapeHtmlText.toString()}
+    ${highlightCodeText.toString()}
     ${renderMarkdownText.toString()}
     const escapeHtml = escapeHtmlText;
     const renderMarkdown = renderMarkdownText;
@@ -333,28 +362,14 @@ export function createPetPageHtml(options = {}) {
     const chatSendBtn = document.getElementById("chatSend");
     const shell = document.getElementById("petShell");
 
-    // Closing is deferred by one animation frame plus the exit duration: the
-    // window shrink is driven by the main process, so if it happens in the same
-    // frame the panel visibly squeezes before disappearing.
-    const CLOSE_ANIM_MS = 150;
-    let closeTimer = null;
+    // Closing is instantaneous on purpose. Any intermediate state (fade, slide)
+    // leaves the panel painted while the main process shrinks the window, which
+    // reads as a flicker; a hard cut never shows that frame.
     function setChatExpanded(expanded) {
       console.log("[renderer] setChatExpanded", expanded);
-      if (closeTimer !== null) { clearTimeout(closeTimer); closeTimer = null; }
-      if (expanded) {
-        chatPanel.classList.remove("is-closing");
-        html.setAttribute("data-chat-expanded", "true");
-        return;
-      }
-      if (!isChatExpanded()) { chatPanel.classList.remove("is-closing"); return; }
-      // Keep the expanded attribute until the exit animation finishes, so the
-      // panel stays laid out at full height for the fade.
-      chatPanel.classList.add("is-closing");
-      closeTimer = setTimeout(() => {
-        closeTimer = null;
-        chatPanel.classList.remove("is-closing");
-        html.removeAttribute("data-chat-expanded");
-      }, CLOSE_ANIM_MS);
+      chatPanel.classList.remove("is-closing");
+      if (expanded) html.setAttribute("data-chat-expanded", "true");
+      else html.removeAttribute("data-chat-expanded");
     }
     function isChatExpanded() { return html.getAttribute("data-chat-expanded") === "true"; }
 
