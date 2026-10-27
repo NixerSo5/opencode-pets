@@ -10,7 +10,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createPetPageHtml } from "./desktop-render.js";
-import { getConfiguredSpriteStates, isLoopingSpriteState, resolveReactionSpriteState } from "./reaction-animation-mapping.js";
+import { defaultPetSprite, getConfiguredSpriteStates, isLoopingSpriteState, resolveReactionSpriteState } from "./reaction-animation-mapping.js";
 import { createManagementHtml } from "./management-render.js";
 import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
@@ -20,6 +20,14 @@ import { createSession, discoverService, getSession, getSessionAfterModelSwitch,
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
+// Collapsed carrier is exactly the scaled sprite footprint plus a small margin.
+// The pet sits at the window's bottom-right corner, so the margin keeps the
+// sprite off the very edge without leaving a large invisible hit area.
+const PET_WINDOW_MARGIN = 8;
+const collapsedWindowSize = {
+    width: Math.ceil(defaultPetSprite.frameWidth * scale) + PET_WINDOW_MARGIN * 2,
+    height: Math.ceil(defaultPetSprite.frameHeight * scale) + PET_WINDOW_MARGIN * 2,
+};
 // Reaction schedule mirroring the original `reactionAnimationMetadata` order
 // (advanced manually via the tray "切换下一个表情"; no automatic polling).
 const reactionSchedule = [
@@ -59,7 +67,6 @@ function focusedPet() {
     }
     return anyPet();
 }
-const collapsedWindowSize = { width: 320, height: 300 };
 // Chat carrier: nominal 1.5x the original 420x640, but clamped to the work area
 // so the pet never gets pushed off its spot on small screens.
 const NOMINAL_EXPANDED_SIZE = { width: 630, height: 960 };
@@ -681,8 +688,8 @@ async function showPetContextMenu(pet) {
  * window, so a new session always gets its own pet.
  */
 function createPetWindow(options = {}) {
-    const width = 320;
-    const height = 300;
+    const width = collapsedWindowSize.width;
+    const height = collapsedWindowSize.height;
     const petEntry = options.petEntry ?? currentPetEntry;
     const window = new BrowserWindow({
         title: "OpenPets pet",
