@@ -1,7 +1,7 @@
 # pet-animation-standalone — 移植与工作状态
 
 > 独立的桌面宠物应用（Electron），从 OpenPets 桌面端 (`C:\Users\nixer\Desktop\ifsOdb\pet\openpets`) 提取/移植而来。
-> 本文档记录：移植了什么、当前工作状态、如何运行。**更新日期：2026-10-26，对应提交 `2a13f94`**。
+> 本文档记录：移植了什么、当前工作状态、如何运行。**更新日期：2026-10-27，对应提交 `2f93f54`**。
 
 ## 1. 项目性质
 
@@ -86,6 +86,8 @@ $env:ELECTRON_ENABLE_LOGGING=1; npx electron .
 | `6106504` | 模型切换（`/model` 端点）+ CLI 发送链路 |
 | `3ece637` | 面板 UI 打磨、Markdown 注入修复、失焦隐藏、排队发送、`activeRuns` Set |
 | `2a13f94` | 关闭瞬时化、代码块语法高亮 |
+| `a9d72c1` | 方案 A：HTTP prompt + SSE form.reply 实现真正的 question 交互；electron-builder 打包配置；右键菜单与 `pet-launch.cmd` |
+| `2f93f54` | 对话文本可选中；每条消息与提问卡片右下角复制按钮（`openpets:pet-copy-text` 走主进程 clipboard） |
 
 ### 详细清单
 
@@ -104,6 +106,7 @@ $env:ELECTRON_ENABLE_LOGGING=1; npx electron .
 - Markdown 支持：围栏代码块、行内代码、粗体、斜体、链接、标题（h3–h5）、无序/有序列表、段落换行。
 - 代码块语法高亮：`highlightCodeText()` 先 stash 字符串/注释，再染关键字/数字，最后还原。配色 `.tok-kw #c792ea` / `.tok-str #c3e88d` / `.tok-comment #7f8c98 斜体` / `.tok-num #f78c6c`。
 - 关闭面板为**瞬时硬切**（无退场动画，避免「挤一下」的闪烁）。
+- 对话文本可选中复制；每条消息与提问卡片右下角有复制按钮。`pet window` 是 `file://` 非安全上下文，`navigator.clipboard` 不可用，复制走 `openpets:pet-copy-text` IPC 到主进程 `clipboard.writeText`。
 - 窗口失焦自动收起面板。
 - 中途发送：`sendQueue` + `drainSendQueue()` 串行执行；Stop 清空队列。
 - 模型行显示当前 model；右键切换后有打勾标记。
@@ -119,10 +122,12 @@ $env:ELECTRON_ENABLE_LOGGING=1; npx electron .
 ### 尚未完成（按优先级）
 
 1. **物理抛掷** — 拖拽松手后按速度抛出、惯性衰减、屏幕边界回弹（原版参考 `pet-motion-engine.ts`、`pet-throw-core.ts`）。
-2. **electron-builder 打包单 exe** — 目前依赖 `npx electron .`，打包后消除对 Electron 二进制的依赖。
-3. **桌面静默启动快捷方式** — `.bat` / 开机自启动。
-4. **Markdown 语法高亮的观感打磨** — 当前配色接近常见深色主题，但尚未与 CLI 实际渲染逐色对齐。
-5. **宠物右键菜单体验打磨** — 菜单项顺序、图标、脏数据（`deepSeekWeb`）导致打勾匹配不上的问题。
+2. **桌面静默启动快捷方式** — `.bat` / 开机自启动。
+3. **Markdown 语法高亮的观感打磨** — 当前配色接近常见深色主题，但尚未与 CLI 实际渲染逐色对齐。
+4. **宠物右键菜单体验打磨** — 菜单项顺序、图标、脏数据（`deepSeekWeb`）导致打勾匹配不上的问题。
+5. **Explorer 右键召唤偶发无效、召唤坐标落点** — 待修。
+6. **面板快速开合稳定性** — 疑似并发 CDP 抢焦点，需干净环境复核。
+7. **代码签名** — 未配置证书。
 
 ## 6. 代码结构速览
 
