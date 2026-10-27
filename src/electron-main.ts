@@ -6,7 +6,7 @@
  * only that tab) in a normal management window.
  */
 
-import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog } from "electron";
+import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog, clipboard } from "electron";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -1056,6 +1056,17 @@ function installIpc(): void {
     }
     if (!killedLocal) return { ok: false, error: "当前没有进行中的回复" };
     return { ok: true };
+  });
+  // Write text to the OS clipboard. Renderers cannot use
+  // navigator.clipboard here: the pet window is a file:// document, which
+  // Chromium treats as a non-secure context, so the async clipboard API is
+  // unavailable. Going through the main process also keeps the copy instant
+  // and synchronous with the click.
+  ipcMain.handle("openpets:pet-copy-text", (_event, payload: unknown) => {
+    const text = typeof payload === "string" ? payload : "";
+    if (text.length === 0) return { ok: false, error: "没有可复制的内容" };
+    clipboard.writeText(text);
+    return { ok: true, length: text.length };
   });
   ipcMain.on("openpets:pet-drag-move", (event, payload: unknown) => {
     const pet = petForSender(event.sender);

@@ -230,8 +230,15 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-ask-option:hover { background: #eef2ff; border-color: #818cf8; transform: translateX(1px); }
   .chat-ask-option[data-picked="true"] { background: #eef2ff; border-color: #4f46e5; }
   .chat-ask-option-desc { display: block; margin-top: 2px; font-weight: 400; font-size: 11px; line-height: 15px; color: #64748b; }
-  .chat-ask-submit { display: block; width: 100%; margin-top: 8px; padding: 8px 10px; border: none; border-radius: 10px; background: #6366f1; color: #ffffff; font: 600 12px/16px "Segoe UI", ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 120ms ease; }
+  .chat-ask-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  .chat-ask-submit { flex: 1 1 auto; margin: 0; padding: 8px 10px; border: none; border-radius: 10px; background: #6366f1; color: #ffffff; font: 600 12px/16px "Segoe UI", ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 120ms ease; }
   .chat-ask-submit:hover { background: #4f46e5; }
+  .chat-copy-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 1px solid rgba(148, 163, 184, 0.55); border-radius: 8px; background: rgba(255, 255, 255, 0.9); color: #475569; cursor: pointer; transition: background 120ms ease, border-color 120ms ease, color 120ms ease; }
+  .chat-copy-btn:hover { background: #eef2ff; border-color: #818cf8; color: #4338ca; }
+  .chat-copy-btn[data-copied="true"] { background: #dcfce7; border-color: #4ade80; color: #15803d; }
+  .chat-copy-btn svg { display: block; }
+  .chat-msg-copy { align-self: flex-end; margin-top: 4px; }
+  .chat-msg.is-user .chat-msg-copy { align-self: flex-end; }
   .chat-ask-custom { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
   .chat-ask-custom-input { flex: 1 1 auto; min-width: 0; padding: 7px 10px; border-radius: 10px; border: 1px solid rgba(165, 180, 252, 0.85); background: #ffffff; color: #1e293b; font: 500 12px/16px "Segoe UI", ui-sans-serif, system-ui, sans-serif; outline: none; transition: border-color 120ms ease; }
   .chat-ask-custom-input:focus { border-color: #6366f1; }
@@ -243,7 +250,8 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-msg { display: flex; flex-direction: column; max-width: 88%; animation: msg-appear 160ms cubic-bezier(0.16, 1, 0.3, 1) forwards; }
   .chat-msg.is-user { align-self: flex-end; }
   .chat-msg.is-assistant { align-self: flex-start; max-width: 92%; }
-  .chat-msg-bubble { padding: 11px 16px; font-size: 16px; line-height: 23px; word-break: break-word; white-space: pre-wrap; }
+  .chat-msg-bubble { padding: 11px 16px; font-size: 16px; line-height: 23px; word-break: break-word; white-space: pre-wrap; user-select: text; -webkit-user-select: text; cursor: text; }
+  .chat-msg { position: relative; }
   .chat-msg.is-user .chat-msg-bubble { background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); color: #ffffff; border-radius: 14px 14px 2px 14px; box-shadow: 0 2px 6px rgba(37, 99, 235, 0.22); }
   .chat-msg.is-assistant .chat-msg-bubble { background: #ffffff; border: 1px solid rgba(226, 232, 240, 0.95); color: #1e293b; border-radius: 14px 14px 14px 2px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04); }
   .chat-msg-bubble > :first-child { margin-top: 0; }
@@ -255,7 +263,7 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
   .chat-msg-bubble li > p { margin: 0; }
   .chat-msg-bubble a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
   .chat-msg-bubble .md-code { padding: 1px 5px; border-radius: 4px; background: rgba(148, 163, 184, 0.18); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 15px; }
-  .chat-msg-bubble .md-pre { margin: 0 0 9px; padding: 11px 14px; border-radius: 10px; background: #0f172a; color: #e2e8f0; overflow-x: auto; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 15px; line-height: 1.5; }
+  .chat-msg-bubble .md-pre { margin: 0 0 9px; padding: 11px 14px; border-radius: 10px; background: #0f172a; color: #e2e8f0; overflow-x: auto; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 15px; line-height: 1.5; user-select: text; -webkit-user-select: text; }
   .chat-msg-bubble .md-pre code { font: inherit; white-space: pre; }
   .chat-msg-bubble .md-pre .tok-kw { color: #c792ea; }
   .chat-msg-bubble .md-pre .tok-str { color: #c3e88d; }
@@ -347,6 +355,42 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       alert: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m21.73 18l-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3M12 9v4m0 4h.01"/></svg>',
       wavingHand: '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14"><path fill="currentColor" fill-rule="evenodd" d="M4.771 1.197A.625.625 0 1 0 4.266.053a3.5 3.5 0 0 0-1.494 1.258a.625.625 0 0 0 1.04.694c.247-.37.582-.642.96-.808m8.563.739a.625.625 0 0 0-1.01.738c.244.332.399.736.427 1.18A.625.625 0 0 0 14 3.771a3.5 3.5 0 0 0-.665-1.836M2.685 7.304a.488.488 0 0 0-.904.367l.687 1.835c.229.61.566 1.173.996 1.663l.346.393a.625.625 0 1 1-.939.825l-.345-.393a6.6 6.6 0 0 1-1.228-2.05L.61 8.11a1.738 1.738 0 0 1 3.075-1.574l1.006-3.755a1.75 1.75 0 0 1 2.635-1.022a1.751 1.751 0 0 1 3.272 1.206l-.149.554a1.75 1.75 0 0 1 1.741 2.204L10.482 12.1a2.63 2.63 0 0 1-1.223 1.594l-.385.222a.625.625 0 1 1-.625-1.082l.385-.223c.316-.182.547-.483.64-.835l1.71-6.377a.5.5 0 0 0-.968-.26l-.758 2.828a.625.625 0 0 1-1.207-.323l.758-2.828l.582-2.175a.5.5 0 0 0-.967-.259l-.35 1.305L7.2 6.949a.625.625 0 0 1-1.207-.323l.874-3.263a.5.5 0 0 0-.968-.259L4.59 7.997c.567.267 1.289.753 1.732 1.522a.625.625 0 1 1-1.082.624c-.383-.66-1.163-1.043-1.53-1.15l-.033-.008a.62.62 0 0 1-.419-.372z" clip-rule="evenodd"/></svg>',
     };
+    // Clipboard icon for the per-card copy button. Renderers cannot use the
+    // async clipboard API here (file:// is a non-secure context), so the click
+    // goes through the preload bridge into the main process.
+    const copyIconSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    const checkIconSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+    // Copy the given text to the OS clipboard and flash a check on the button.
+    // The button is passed in so the same helper serves message bubbles and
+    // the ask card.
+    function copyCardText(button, text) {
+      const value = typeof text === "string" ? text : "";
+      if (value.length === 0 || typeof window.openpetsDemo?.copyText !== "function") return;
+      Promise.resolve(window.openpetsDemo.copyText(value)).then((result) => {
+        if (!result || !result.ok) return;
+        button.innerHTML = checkIconSvg;
+        button.setAttribute("data-copied", "true");
+        clearTimeout(button._resetTimer);
+        button._resetTimer = setTimeout(() => {
+          button.innerHTML = copyIconSvg;
+          button.removeAttribute("data-copied");
+        }, 1200);
+      }).catch(() => undefined);
+    }
+    function createCopyButton(className, getText) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = className;
+      button.title = "复制";
+      button.setAttribute("aria-label", "复制这条内容");
+      button.innerHTML = copyIconSvg;
+      button.addEventListener("click", (event) => {
+        // Never let the click bubble into the pet drag/click handler.
+        event.stopPropagation();
+        copyCardText(button, getText());
+      });
+      return button;
+    }
     const badge = document.getElementById("bubble");
     function getStatusBadge(reaction) {
       if (reaction === "waving") return { className: "is-info", iconSvg: statusIcons.wavingHand, label: "Hi" };
@@ -441,6 +485,9 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
       if (role === "assistant") bubbleEl.innerHTML = renderMarkdown(text);
       else bubbleEl.textContent = text;
       wrap.appendChild(bubbleEl);
+      // Every card carries its own copy button in the bottom-right corner; the
+      // copied text is the message body, not the rendered HTML.
+      wrap.appendChild(createCopyButton("chat-copy-btn chat-msg-copy", () => text));
       chatTranscript.appendChild(wrap);
       chatTranscript.scrollTop = chatTranscript.scrollHeight;
     }
@@ -713,7 +760,23 @@ export function createPetPageHtml(options: PetPageOptions = {}): string {
         const newline = String.fromCharCode(10);
         void sendCurrentText("回答你的问题：" + newline + lines.join(newline));
       });
-      chatAsk.appendChild(submit);
+      const footer = document.createElement("div");
+      footer.className = "chat-ask-footer";
+      footer.appendChild(submit);
+      // Same copy affordance as the message cards: the ask itself, rendered as
+      // readable question/answer lines.
+      footer.appendChild(createCopyButton("chat-copy-btn", () => {
+        const lines = [];
+        ask.questions.forEach((question, questionIndex) => {
+          if (!question || typeof question.question !== "string") return;
+          lines.push(
+            (lines.length + 1) + ". " + (question.header ? question.header + "：" : "") + question.question +
+              " -> " + (chosen[questionIndex] ?? "(未回答)"),
+          );
+        });
+        return lines.join(String.fromCharCode(10));
+      }));
+      chatAsk.appendChild(footer);
       askCounter += 1;
       console.log("[renderer] ask rendered", askCounter, (ask.questions || []).length);
       chatTranscript.scrollTop = chatTranscript.scrollHeight;

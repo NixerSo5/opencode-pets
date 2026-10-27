@@ -46,6 +46,12 @@ contextBridge.exposeInMainWorld("openpetsDemo", {
   chatHistory: () => {
     return ipcRenderer.invoke("openpets:pet-chat-history");
   },
+  // The pet window is a file:// document (non-secure context), so the async
+  // clipboard API is unavailable; copying goes through the main process.
+  copyText: (text) => {
+    if (typeof text !== "string" || text.length === 0) return Promise.resolve({ ok: false, error: "没有可复制的内容" });
+    return ipcRenderer.invoke("openpets:pet-copy-text", text);
+  },
   chatStop: () => {
     return ipcRenderer.invoke("openpets:pet-chat-stop");
   },
