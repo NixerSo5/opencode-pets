@@ -7,6 +7,8 @@
  */
 import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog, clipboard, Notification } from "electron";
 import { mkdir, rename, writeFile } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createPetPageHtml } from "./desktop-render.js";
@@ -17,7 +19,7 @@ import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
 import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, } from "./pet-store.js";
 import { pickReactionMessage } from "./reaction-messages.js";
-import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, parseFormCreated, readTimeline, replyForm, deleteSession, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, turnResultAfter, } from "./opencode-client.js";
+import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, parseFormCreated, readTimeline, toolSummary, replyForm, deleteSession, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, turnResultAfter, } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
@@ -467,6 +469,82 @@ function handleWatchStatus(update) {
             return;
     }
 }
+/**
+ * Turn one live SSE event into a chat-panel process row, mirroring what the
+ * CLI prints while a turn runs ("→ shell  Get-ChildItem …").
+ *
+ * Two event families carry tool progress:
+ * - `session.tool.called/success/failed` with `{ tool | name, input? }`
+ * - `message.part.updated` / `message.part.updated.batch` carrying a `part`
+ *   whose `type` is `tool` and `state` holds `status` + `input`
+ * Both are normalized into `{ id, tool, status, text }`, the shape the panel's
+ * `addProcessRow` already renders. Returns undefined for events that are not
+ * tool progress.
+ */
+function readProcessRow(type, raw) {
+    const asRecord = (value) => typeof value === "object" && value !== null ? value : undefined;
+    const payload = asRecord(raw);
+    if (payload === undefined)
+        return undefined;
+    // `session.tool.*` wraps the real tool record under `payload.data`. Only
+    // `called` is a user-visible step: the panel shows one "running" row per
+    // tool call and never a completion row, so the other subtypes
+    // (input.started / input.ended / progress / success / failed) are dropped.
+    if (type.startsWith("session.tool.")) {
+        if (type !== "session.tool.called")
+            return undefined;
+        const data = asRecord(payload.data);
+        if (data === undefined)
+            return undefined;
+        const name = (typeof data.tool === "string" ? data.tool : undefined) ||
+            (typeof data.name === "string" ? data.name : undefined) ||
+            "tool";
+        const state = asRecord(data.state);
+        const input = asRecord(state?.input) ?? asRecord(data.input);
+        const id = (typeof data.callID === "string" ? data.callID : undefined) ||
+            (typeof data.id === "string" ? data.id : undefined);
+        if (id === undefined)
+            return undefined;
+        return { id, tool: name, status: "running", text: toolSummary(name, input) };
+    }
+    // `message.part.updated*` wraps the tool block under `part`.
+    const part = asRecord(payload.part) ?? payload;
+    const kind = typeof part.type === "string" ? part.type : "";
+    if (type.startsWith("session.tool.")) {
+        // Legacy tool feed: payload itself is the tool record.
+    }
+    else if (kind !== "tool") {
+        // A `message.part.updated` for text/reasoning/step is not tool progress.
+        return undefined;
+    }
+    const name = (typeof part.tool === "string" ? part.tool : undefined) ||
+        (typeof part.name === "string" ? part.name : undefined) ||
+        (typeof payload.tool === "string" ? payload.tool : undefined) ||
+        (typeof payload.name === "string" ? payload.name : undefined) ||
+        "tool";
+    const state = asRecord(part.state) ?? asRecord(payload.state);
+    let status = typeof state?.status === "string" ? state.status : undefined;
+    if (status === undefined) {
+        if (type === "session.tool.success")
+            status = "completed";
+        else if (type === "session.tool.failed")
+            status = "error";
+        else if (type === "session.tool.called")
+            status = "running";
+    }
+    const input = asRecord(state?.input) ?? asRecord(part.input) ?? asRecord(payload.input);
+    // The panel de-duplicates process rows by this id, so it must be the tool
+    // call id and must stay identical across every event of the same call.
+    // A synthesized fallback would mint a fresh id per event and flood the
+    // panel with duplicate rows, so give up instead of guessing.
+    const id = (typeof part.callID === "string" ? part.callID : undefined) ||
+        (typeof payload.callID === "string" ? payload.callID : undefined) ||
+        (typeof part.id === "string" ? part.id : undefined) ||
+        (typeof payload.id === "string" ? payload.id : undefined);
+    if (id === undefined)
+        return undefined;
+    return { id, tool: name, text: toolSummary(name, input), ...(status === undefined ? {} : { status }) };
+}
 /** Start the shared SSE watcher once; it reconnects on its own afterwards. */
 function startWatch() {
     if (watch !== undefined)
@@ -508,6 +586,17 @@ function startWatch() {
             const pet = petForSession(sessionID);
             if (pet === undefined)
                 return;
+            // Mirror the CLI progress feed into the chat panel: every tool call/result
+            // becomes one process row, pushed incrementally instead of waiting for the
+            // turn to end and re-reading history.
+            if (event.type.startsWith("session.tool.") || event.type === "message.part.updated" || event.type === "message.part.updated.batch") {
+                const panel = pet.panelWindow;
+                if (panel !== null && !panel.isDestroyed()) {
+                    const row = readProcessRow(event.type, event.payload);
+                    if (row !== undefined)
+                        panel.webContents.send("openpets:pet-process", row);
+                }
+            }
             if (event.type === "session.step.started")
                 applyReaction(pet, "thinking", "想了想下一步");
             if (event.type === "session.step.ended")
@@ -530,11 +619,14 @@ async function attachSession(pet, directory) {
     const discovered = await discoverService();
     if (discovered === undefined)
         return { ok: false, message: "没找到正在运行的 OpenCode 服务（service.json 缺失）" };
+    console.log(`[summon-debug] attachSession directory=${directory} endpoint=${discovered.url}`);
     pet.endpoint = discovered;
     pet.directory = directory;
     startWatch();
     try {
+        console.log(`[summon-debug] createSession with directory=${directory} title=${sessionLabel(directory)}`);
         const session = await createSession(discovered, directory, sessionLabel(directory));
+        console.log(`[summon-debug] createSession returned id=${session.id} location=${JSON.stringify(session.location)}`);
         pet.sessionID = session.id;
         pet.sessionTitle = session.title ?? sessionLabel(directory);
         watch?.track({ id: session.id, title: pet.sessionTitle, directory });
@@ -702,6 +794,7 @@ async function runSummon(pet, request) {
         win.focus();
     }
     sayWelcome(pet);
+    console.log(`[summon-debug] runSummon request.directory=${request.directory}`);
     const result = await attachSession(pet, request.directory);
     say(pet, result.ok ? `${sessionLabel(request.directory)} · ${result.message ?? ""}` : `召唤失败：${result.message ?? "未知错误"}`);
     publishPanelState(pet);
@@ -938,13 +1031,30 @@ async function showPetContextMenu(pet) {
             sessionItems.push({ label: "没有会话", enabled: false });
         }
         else {
-            for (const session of sessions.slice(0, 20)) {
+            // A session can be bound to exactly one pet. Skip sessions already owned
+            // by another pet so the same session id never appears on two pets.
+            const available = sessions.filter((session) => {
+                const owner = petForSession(session.id);
+                return owner === undefined || owner === pet;
+            });
+            if (available.length === 0) {
+                sessionItems.push({ label: "没有可用的会话", enabled: false });
+            }
+            for (const session of available.slice(0, 20)) {
                 const directory = session.location?.directory ?? "";
                 sessionItems.push({
                     label: `${session.title ?? session.id} — ${basename(directory) || "?"}`,
                     type: "radio",
                     checked: session.id === pet.sessionID,
                     click: () => {
+                        // Re-check at click time: another pet may have claimed this session
+                        // between opening the menu and the click.
+                        const owner = petForSession(session.id);
+                        if (owner !== undefined && owner !== pet) {
+                            say(pet, "这个会话已被其他宠物占用");
+                            publishPanelState(pet);
+                            return;
+                        }
                         pet.sessionID = session.id;
                         pet.sessionTitle = session.title ?? sessionLabel(directory);
                         pet.directory = directory;
@@ -1212,6 +1322,15 @@ function installIpc() {
         if (pet === undefined)
             return;
         setChatExpanded(pet, false);
+    });
+    // Temporary diagnostics: the panel runs without a devtools console the user
+    // can open, so it forwards log lines here and they land in a file next to the
+    // summon log. Remove together with `debugLog` in panel-preload.cjs.
+    ipcMain.on("openpets:panel-debug-log", (_event, message) => {
+        try {
+            appendFileSync(join(tmpdir(), "openpets-panel.log"), `${new Date().toISOString()} ${String(message)}\n`);
+        }
+        catch { /* diagnostics must never break the app */ }
     });
     // Full projected transcript for the bound session, oldest first. The panel
     // calls this on open so the first paint shows real OpenCode history.

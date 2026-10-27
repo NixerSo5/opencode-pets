@@ -509,47 +509,95 @@ function describeError(message) {
     return undefined;
 }
 /**
- * Flatten the projected message timeline into simple role/text rows.
+ * Condense a tool call's input into one readable line (the CLI prints the
+ * command / path it is about to touch, not the whole JSON blob).
+ */
+export function toolSummary(name, input) {
+    if (input === undefined)
+        return "";
+    const pick = (key) => {
+        const value = input[key];
+        return typeof value === "string" ? value.trim() : "";
+    };
+    const preferred = pick("command") || pick("filePath") || pick("path") || pick("pattern") || pick("query") || pick("url");
+    if (preferred.length > 0)
+        return preferred;
+    // `edit`/`write` carry the target under `filePath`; `read` under `path`.
+    const keys = Object.keys(input);
+    if (keys.length === 0)
+        return "";
+    const first = input[keys[0]];
+    if (typeof first === "string")
+        return first.trim();
+    const json = JSON.stringify(input);
+    return json.length > 160 ? json.slice(0, 160) + "…" : json;
+}
+/**
+ * Flatten the projected message timeline into renderable rows.
  *
  * The v2 projection puts visible text under `content` (not `parts`) and labels
  * the row with `type` (`user` | `assistant` | `idle`) rather than `role`.
- * Reasoning blocks are dropped: the pet only needs the answer.
+ *
+ * Every content block becomes its own row so the panel can mirror the CLI:
+ * `text` blocks render as chat bubbles, `tool` blocks render as process rows
+ * (name + status + a one-line argument summary). Reasoning blocks stay
+ * dropped — they are private scratch work, not progress.
  *
  * The projection returns newest first; the chat panel renders oldest first,
  * so the flattened rows are reversed here once.
  */
 export async function readTimeline(endpoint, sessionID) {
     const body = await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/message`);
-    const rows = (body.data ?? []).flatMap((message) => {
+    const rows = [];
+    for (const message of body.data ?? []) {
         const role = message.type ?? message.role ?? "assistant";
         const error = describeError(message);
         // A failed turn (e.g. provider 503) has no visible text, so surface it as
         // its own row instead of dropping it: the panel can then explain the
         // failure instead of appearing to hang.
         if (role === "idle") {
-            if (error === undefined)
-                return [];
-            return [{ id: message.id, role: "error", text: error, time: message.time?.created, error }];
+            if (error !== undefined)
+                rows.push({ id: message.id, role: "error", text: error, time: message.time?.created, error, kind: "error" });
+            continue;
         }
-        const blocks = message.content ?? message.parts ?? [];
-        const fromBlocks = blocks
-            .filter((block) => block.type === "text" && typeof block.text === "string")
-            .map((block) => block.text)
-            .join("\n")
-            .trim();
-        // User prompts live on the message itself; assistant answers live in content.
-        const text = fromBlocks.length > 0
-            ? fromBlocks
-            : typeof message.text === "string" ? message.text.trim() : "";
         if (role !== "user" && role !== "assistant")
-            return [];
-        if (text.length === 0) {
-            if (error === undefined)
-                return [];
-            return [{ id: message.id, role, text: "", time: message.time?.created, error }];
+            continue;
+        const blocks = message.content ?? message.parts ?? [];
+        if (blocks.length === 0) {
+            // User prompts live on the message itself, not in content.
+            const text = typeof message.text === "string" ? message.text.trim() : "";
+            if (text.length > 0)
+                rows.push({ id: message.id, role, text, time: message.time?.created, kind: "chat" });
+            else if (error !== undefined)
+                rows.push({ id: message.id, role, text: "", time: message.time?.created, error, kind: "error" });
+            continue;
         }
-        return [{ id: message.id, role, text, time: message.time?.created, ...(error === undefined ? {} : { error }) }];
-    });
+        blocks.forEach((block, index) => {
+            const rowID = `${message.id}:${index}`;
+            if (block.type === "tool") {
+                const name = typeof block.name === "string" && block.name.length > 0 ? block.name : "tool";
+                // Match the live feed: a tool row always renders as "running" (●).
+                // The projection only carries the final state, and showing → here
+                // would make a reopened panel look different from the live one.
+                rows.push({
+                    id: rowID,
+                    role: "assistant",
+                    text: toolSummary(name, block.state?.input),
+                    time: message.time?.created,
+                    kind: "tool",
+                    tool: name,
+                    status: "running",
+                });
+                return;
+            }
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) {
+                rows.push({ id: rowID, role, text: block.text.trim(), time: message.time?.created, kind: "chat" });
+            }
+        });
+        if (error !== undefined) {
+            rows.push({ id: `${message.id}:error`, role, text: "", time: message.time?.created, error, kind: "error" });
+        }
+    }
     return rows.reverse();
 }
 /**

@@ -56,12 +56,53 @@ function readCursorCoord(args: readonly string[], flag: string): number | undefi
   return value === 0 ? undefined : value;
 }
 
+/**
+ * Extract the `--dir` value from argv.
+ *
+ * Two argv shapes reach us:
+ *
+ * 1. First launch — Explorer's script passes `--dir <path>` normally.
+ * 2. `second-instance` — Electron re-orders argv before delivering it: every
+ *    `--switch` moves to the front, then bare arguments follow. The click path
+ *    ends up as a bare argument near the end (next to the app directory and
+ *    the `0 0` coordinates), and `--dir` is followed by another switch. A
+ *    position-based read therefore always loses the path.
+ *
+ * For case 2, pick the last bare argument that resolves to an existing
+ * directory. The app path also resolves, but the clicked folder comes after
+ * it, so `last` is the correct one.
+ */
+function findDirectoryArg(argv: readonly string[]): string | undefined {
+  const PREFIX = "--dir=";
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === "--dir") {
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) return next;
+      continue;
+    }
+    if (token.startsWith(PREFIX)) {
+      const value = token.slice(PREFIX.length);
+      if (value.length > 0) return value;
+    }
+  }
+  // Fallback for the re-ordered `second-instance` shape.
+  for (let i = argv.length - 1; i >= 0; i -= 1) {
+    const token = argv[i];
+    if (token.startsWith("--") || token.length === 0) continue;
+    // Skip pure numbers (the `0 0` coordinates).
+    if (/^-?\d+$/.test(token)) continue;
+    const absolute = resolve(token);
+    if (existsSync(absolute) && statSync(absolute).isDirectory()) return absolute;
+  }
+  return undefined;
+}
+
 /** Parse argv (without the electron/exe prefix). Returns undefined when not a summon. */
 export function parseSummonRequest(argv: readonly string[]): SummonRequest | undefined {
   if (!argv.includes(SUMMON_FLAG)) return undefined;
-  const dirIndex = argv.indexOf("--dir");
   return {
-    directory: resolveDirectory(dirIndex === -1 ? undefined : argv[dirIndex + 1]),
+    directory: resolveDirectory(findDirectoryArg(argv)),
     x: readCursorCoord(argv, "--x"),
     y: readCursorCoord(argv, "--y"),
   };

@@ -106,6 +106,31 @@ export function renderMarkdownText(source) {
             out.push("<h" + level + ">" + inline(heading[2]) + "</h" + level + ">");
             continue;
         }
+        // Markdown tables: a row of `| a | b |` followed by a `|---|` separator.
+        if (line.includes("|") && line.trimStart().startsWith("|")) {
+            const isSeparator = (value) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(value);
+            if (isSeparator(line) && out.length > 0 && out[out.length - 1].startsWith("<table")) {
+                continue;
+            }
+            const splitRow = (value) => {
+                const trimmed = value.trim().replace(/^\|/, "").replace(/\|$/, "");
+                return trimmed.split("|").map((cell) => cell.trim());
+            };
+            const nextLine = lines[lines.indexOf(raw) + 1];
+            const startsTable = nextLine !== undefined && isSeparator(nextLine);
+            if (startsTable) {
+                flushPara();
+                closeList();
+                const headers = splitRow(line);
+                out.push("<table class=\"md-table\"><thead><tr>" + headers.map((cell) => "<th>" + inline(cell) + "</th>").join("") + "</tr></thead><tbody>");
+                continue;
+            }
+            if (out.length > 0 && out[out.length - 1].startsWith("<table")) {
+                const cells = splitRow(line);
+                out[out.length - 1] += "<tr>" + cells.map((cell) => "<td>" + inline(cell) + "</td>").join("") + "</tr>";
+                continue;
+            }
+        }
         const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
         const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
         if (bullet || numbered) {

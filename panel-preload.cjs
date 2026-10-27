@@ -5,11 +5,15 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 let panelStateHandler = null;
 let askHandler = null;
+let processHandler = null;
 ipcRenderer.on("openpets:pet-panel-state", (_event, payload) => {
   panelStateHandler?.(payload);
 });
 ipcRenderer.on("openpets:pet-ask", (_event, payload) => {
   askHandler?.(payload);
+});
+ipcRenderer.on("openpets:pet-process", (_event, payload) => {
+  processHandler?.(payload);
 });
 
 contextBridge.exposeInMainWorld("openpetsPanel", {
@@ -18,6 +22,9 @@ contextBridge.exposeInMainWorld("openpetsPanel", {
   },
   onAsk: (callback) => {
     if (typeof callback === "function") askHandler = callback;
+  },
+  onProcess: (callback) => {
+    if (typeof callback === "function") processHandler = callback;
   },
   chatHistory: () => {
     return ipcRenderer.invoke("openpets:pet-chat-history");
@@ -43,5 +50,12 @@ contextBridge.exposeInMainWorld("openpetsPanel", {
   },
   closePanel: () => {
     ipcRenderer.send("openpets:panel-close");
+  },
+  // Temporary diagnostics: the panel has no console the user can open, so log
+  // lines are forwarded to the main process, which appends them to a file.
+  debugLog: (message) => {
+    try {
+      ipcRenderer.send("openpets:panel-debug-log", String(message ?? ""));
+    } catch { /* diagnostics must never break the UI */ }
   },
 });

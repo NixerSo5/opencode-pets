@@ -208,13 +208,32 @@ export interface TimelineEntry {
     readonly time?: number;
     /** Present when the server reported a failure for this turn (e.g. 503). */
     readonly error?: string;
+    /**
+     * Rendering hint. `chat` is a normal user/assistant bubble; `tool` is an
+     * intermediate process row (the CLI equivalent of "→ shell ..."); `error`
+     * is a failed turn.
+     */
+    readonly kind?: "chat" | "tool" | "error";
+    /** Tool name for `kind: "tool"` rows. */
+    readonly tool?: string;
+    /** Tool call status (`running` / `completed` / `error`) for tool rows. */
+    readonly status?: string;
 }
 /**
- * Flatten the projected message timeline into simple role/text rows.
+ * Condense a tool call's input into one readable line (the CLI prints the
+ * command / path it is about to touch, not the whole JSON blob).
+ */
+export declare function toolSummary(name: string, input: Record<string, unknown> | undefined): string;
+/**
+ * Flatten the projected message timeline into renderable rows.
  *
  * The v2 projection puts visible text under `content` (not `parts`) and labels
  * the row with `type` (`user` | `assistant` | `idle`) rather than `role`.
- * Reasoning blocks are dropped: the pet only needs the answer.
+ *
+ * Every content block becomes its own row so the panel can mirror the CLI:
+ * `text` blocks render as chat bubbles, `tool` blocks render as process rows
+ * (name + status + a one-line argument summary). Reasoning blocks stay
+ * dropped — they are private scratch work, not progress.
  *
  * The projection returns newest first; the chat panel renders oldest first,
  * so the flattened rows are reversed here once.
