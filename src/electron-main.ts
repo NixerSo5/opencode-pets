@@ -6,12 +6,13 @@
  * only that tab) in a normal management window.
  */
 
-import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog, clipboard } from "electron";
+import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog, clipboard, Notification } from "electron";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
 import { createPetPageHtml } from "./desktop-render.js";
+import { createPanelPageHtml } from "./panel-render.js";
 import { defaultPetSprite, getConfiguredSpriteStates, isLoopingSpriteState, resolveReactionSpriteState } from "./reaction-animation-mapping.js";
 import { createManagementHtml, type PetListItem } from "./management-render.js";
 import { getCatalogPage, getCatalogAllPets, type CatalogPetEntry } from "./catalog-client.js";
@@ -39,6 +40,7 @@ import {
   parseFormCreated,
   readTimeline,
   replyForm,
+  deleteSession,
   abortRunPrompt,
   runPrompt,
   sendPrompt,
@@ -50,13 +52,15 @@ import { OpenCodeWatch } from "./opencode-watch.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor, type SummonRequest } from "./summon.js";
 
 const scale = 0.75;
-// Collapsed carrier is exactly the scaled sprite footprint plus a small margin.
-// The pet sits at the window's bottom-right corner, so the margin keeps the
-// sprite off the very edge without leaving a large invisible hit area.
+// Collapsed carrier is the scaled sprite footprint plus a small margin, plus a
+// reserved strip above the sprite for the speech bubble. The sprite is pinned to
+// the window's bottom-right corner, so growing the window only adds room above
+// the pet and never moves it on screen.
 const PET_WINDOW_MARGIN = 8;
+const BUBBLE_STRIP_HEIGHT = 90;
 const collapsedWindowSize = {
   width: Math.ceil(defaultPetSprite.frameWidth * scale) + PET_WINDOW_MARGIN * 2,
-  height: Math.ceil(defaultPetSprite.frameHeight * scale) + PET_WINDOW_MARGIN * 2,
+  height: Math.ceil(defaultPetSprite.frameHeight * scale) + PET_WINDOW_MARGIN * 2 + BUBBLE_STRIP_HEIGHT,
 };
 // Reaction schedule mirroring the original `reactionAnimationMetadata` order
 // (advanced manually via the tray "切换下一个表情"; no automatic polling).
@@ -89,9 +93,14 @@ interface PetInstance {
   lastSpriteState: string;
   revertTimer: NodeJS.Timeout | null;
   idleRevertTimer: NodeJS.Timeout | null;
-  /** Chat carrier state (original expandedPetWindowSize behavior). */
+  /** Whether the floating chat panel window is currently shown. */
   chatExpanded: boolean;
-  collapsedAnchor: { x: number; y: number } | null;
+  /**
+   * The chat panel's own BrowserWindow. Lazily created on first open and then
+   * reused: closing the panel only hides it, so the transcript keeps its DOM.
+   * The pet window is never resized, moved or otherwise involved.
+   */
+  panelWindow: BrowserWindow | null;
 }
 
 /** Keyed by `webContents.id`, which every IPC event carries. */
@@ -127,15 +136,103 @@ function focusedPet(): PetInstance | undefined {
   return anyPet();
 }
 
-// Chat carrier: nominal 1.5x the original 420x640, but clamped to the work area
-// so the pet never gets pushed off its spot on small screens.
-const NOMINAL_EXPANDED_SIZE = { width: 630, height: 960 };
+// Chat panel: its own floating window, anchored to the pet like an Ant Design
+// Popconfirm. The pet window keeps this size forever; nothing here touches it.
+const PANEL_SIZE = { width: 560, height: 700 };
+// Gap between the pet's window edge and the panel, so the panel never covers it.
+// Kept small: the carrier window already pads the sprite by PET_WINDOW_MARGIN
+// plus the reserved bubble strip, so a large gap here reads as "far from pet".
+const PANEL_GAP = 8;
 
-function computeExpandedWindowSize(): { width: number; height: number } {
-  const area = screen.getPrimaryDisplay().workArea;
+// Pick the work area of the display that actually contains the anchor point, so a
+// pet dragged to a secondary monitor opens its panel on that monitor instead of
+// snapping back to the primary one.
+function workAreaForPoint(point: { x: number; y: number }): Electron.Rectangle {
+  return screen.getDisplayNearestPoint(point).workArea;
+}
+
+/**
+ * Popconfirm-style placements, named after the Ant Design component: the axis
+ * says which side of the anchor the panel sits on, the suffix says how the
+ * panel's other axis is aligned with the anchor's edge.
+ */
+type PanelSide = "top" | "bottom" | "left" | "right";
+type PanelAlign = "start" | "center" | "end";
+type PanelPlacement = { side: PanelSide; align: PanelAlign };
+
+/** Try to place the panel on `side`, returning bounds or null when it overflows. */
+function placeOnSide(
+  anchor: Electron.Rectangle,
+  size: { width: number; height: number },
+  side: PanelSide,
+  align: PanelAlign,
+  area: Electron.Rectangle,
+): { x: number; y: number } | null {
+  let x: number;
+  let y: number;
+  if (side === "top" || side === "bottom") {
+    y = side === "top" ? anchor.y - PANEL_GAP - size.height : anchor.y + anchor.height + PANEL_GAP;
+    const leftEdge = anchor.x;
+    const centerEdge = anchor.x + (anchor.width - size.width) / 2;
+    const rightEdge = anchor.x + anchor.width - size.width;
+    x = align === "start" ? leftEdge : align === "end" ? rightEdge : centerEdge;
+  } else {
+    x = side === "left" ? anchor.x - PANEL_GAP - size.width : anchor.x + anchor.width + PANEL_GAP;
+    const topEdge = anchor.y;
+    const centerEdge = anchor.y + (anchor.height - size.height) / 2;
+    const bottomEdge = anchor.y + anchor.height - size.height;
+    y = align === "start" ? topEdge : align === "end" ? bottomEdge : centerEdge;
+  }
+  if (x < area.x || y < area.y || x + size.width > area.x + area.width || y + size.height > area.y + area.height) {
+    return null;
+  }
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+/**
+ * Compute the panel window bounds next to `anchor` (the pet's window rect).
+ *
+ * Pure geometry, no window mutation: pick the preferred side from the free
+ * space around the pet, then fall back through the other sides when the panel
+ * would leave the work area, and finally clamp so a very large panel on a very
+ * small screen still stays visible.
+ */
+function computePanelBounds(
+  anchor: Electron.Rectangle,
+  size: { width: number; height: number },
+  area: Electron.Rectangle,
+): { x: number; y: number; width: number; height: number; placement: PanelPlacement } {
+  const spaceUp = anchor.y - area.y;
+  const spaceDown = area.y + area.height - (anchor.y + anchor.height);
+  const spaceLeft = anchor.x - area.x;
+  const spaceRight = area.x + area.width - (anchor.x + anchor.width);
+  // Prefer the roomiest vertical side; fall back to horizontal only when neither
+  // vertical side can hold the panel.
+  const verticalFirst: PanelSide[] = spaceDown >= spaceUp ? ["bottom", "top"] : ["top", "bottom"];
+  const horizontalFirst: PanelSide[] = spaceRight >= spaceLeft ? ["right", "left"] : ["left", "right"];
+  const fitsVertically = Math.max(spaceUp, spaceDown) >= size.height + PANEL_GAP;
+  const sides = fitsVertically ? [...verticalFirst, ...horizontalFirst] : [...horizontalFirst, ...verticalFirst];
+  // Centre alignment is the nicest; nudge to a flush edge when the centred
+  // variant would overflow the work area.
+  const aligns: PanelAlign[] = ["center", "start", "end"];
+  for (const side of sides) {
+    for (const align of aligns) {
+      const placed = placeOnSide(anchor, size, side, align, area);
+      if (placed !== null) return { ...placed, width: size.width, height: size.height, placement: { side, align } };
+    }
+  }
+  // Nothing fits cleanly: keep the roomiest side and clamp inside the work area.
+  const side = sides[0] ?? "bottom";
+  const align: PanelAlign = "center";
+  const rough = placeOnSide(anchor, size, side, align, {
+    x: -1e6, y: -1e6, width: 2e6, height: 2e6,
+  }) ?? { x: anchor.x, y: anchor.y + anchor.height + PANEL_GAP };
   return {
-    width: Math.min(NOMINAL_EXPANDED_SIZE.width, area.width - 8),
-    height: Math.min(NOMINAL_EXPANDED_SIZE.height, area.height - 8),
+    x: Math.min(Math.max(rough.x, area.x + 2), area.x + area.width - size.width - 2),
+    y: Math.min(Math.max(rough.y, area.y + 2), area.y + area.height - size.height - 2),
+    width: size.width,
+    height: size.height,
+    placement: { side, align },
   };
 }
 
@@ -195,52 +292,181 @@ function sayWelcome(pet: PetInstance): void {
   pet.idleRevertTimer.unref?.();
 }
 
+/**
+ * The sprite's rectangle inside a pet carrier window.
+ *
+ * The sprite is pinned to the bottom-right corner, inset by PET_WINDOW_MARGIN;
+ * everything above it is transparent space reserved for the speech bubble.
+ * Panel placement uses this so the panel hugs the pet instead of the window.
+ */
+function petSpriteBounds(windowBounds: Electron.Rectangle): Electron.Rectangle {
+  const spriteWidth = collapsedWindowSize.width;
+  const spriteHeight = collapsedWindowSize.height - BUBBLE_STRIP_HEIGHT;
+  return {
+    x: windowBounds.x + windowBounds.width - spriteWidth,
+    y: windowBounds.y + windowBounds.height - spriteHeight,
+    width: spriteWidth,
+    height: spriteHeight,
+  };
+}
+
 function clampPointToWorkArea(point: { x: number; y: number }, size: { width: number; height: number }): { x: number; y: number } {
-  const area = screen.getPrimaryDisplay().workArea;
+  const area = workAreaForPoint(point);
   return {
     x: Math.min(Math.max(point.x, area.x + 2), area.x + area.width - size.width - 2),
     y: Math.min(Math.max(point.y, area.y + 2), area.y + area.height - size.height - 2),
   };
 }
 
-/**
- * Anchor-preserving bounds: the pet stays at its spot while the window grows
- * upward/sideways. The pet is centred horizontally and sits at the bottom, so
- * the window origin moves by half the width delta and the full height delta.
- * When the work area forces a clamp, the resulting pet offset is reported back
- * so the caller can compensate instead of letting the pet drift.
- */
-function expandedBoundsFor(collapsed: { x: number; y: number }): {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  petOffset: { x: number; y: number };
-} {
-  const size = computeExpandedWindowSize();
-  // The pet sits at the window's bottom-right corner, so that corner must not
-  // move: keep the right and bottom edges fixed and grow left/up instead.
-  const desired = {
-    x: collapsed.x + collapsedWindowSize.width - size.width,
-    y: collapsed.y + collapsedWindowSize.height - size.height,
-  };
-  const clamped = clampPointToWorkArea(desired, size);
+/** Shrink the nominal panel to fit the work area it will be shown on. */
+function panelSizeFor(anchor: { x: number; y: number }): { width: number; height: number } {
+  const area = workAreaForPoint(anchor);
   return {
-    ...clamped,
-    width: size.width,
-    height: size.height,
-    petOffset: { x: clamped.x - desired.x, y: clamped.y - desired.y },
+    width: Math.max(280, Math.min(PANEL_SIZE.width, area.width - 24)),
+    height: Math.max(260, Math.min(PANEL_SIZE.height, area.height - 24)),
   };
 }
 
 function publishPanelState(pet: PetInstance | undefined): void {
-  if (pet === undefined || pet.window.isDestroyed()) return;
-  // Include the bound session title so switching/creating a session refreshes
-  // the panel header without a separate history round-trip.
-  pet.window.webContents.send("openpets:pet-panel-state", {
-    chatExpanded: pet.chatExpanded,
-    sessionTitle: pet.sessionTitle ?? "",
+  if (pet === undefined) return;
+  // The panel owns its header now; push the bound session title there so a
+  // session switch updates it without waiting for a history round-trip.
+  if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
+    pet.panelWindow.webContents.send("openpets:pet-panel-state", {
+      chatExpanded: pet.chatExpanded,
+      sessionTitle: pet.sessionTitle ?? "",
+    });
+  }
+  // The pet window still needs the flag to keep its own affordances in sync.
+  if (!pet.window.isDestroyed()) {
+    pet.window.webContents.send("openpets:pet-panel-state", {
+      chatExpanded: pet.chatExpanded,
+      sessionTitle: pet.sessionTitle ?? "",
+    });
+  }
+}
+
+/** Find the pet that owns a panel window's webContents (or a pet window's). */
+function petForPanelSender(sender: Electron.WebContents): PetInstance | undefined {
+  const direct = pets.get(sender.id);
+  if (direct !== undefined) return direct;
+  for (const pet of pets.values()) {
+    if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed() && pet.panelWindow.webContents.id === sender.id) return pet;
+  }
+  return undefined;
+}
+
+/**
+ * Get (creating on first use) the floating chat panel for `pet`.
+ *
+ * The panel is a normal frameless always-on-top window that loads
+ * `createPanelPageHtml`. It has its own preload so its IPC cannot be confused
+ * with the pet window's, and it is hidden rather than destroyed on close so the
+ * rendered transcript survives a toggle.
+ */
+function ensurePanelWindow(pet: PetInstance): BrowserWindow | null {
+  if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) return pet.panelWindow;
+  if (pet.window.isDestroyed()) return null;
+  const size = panelSizeFor(pet.window.getBounds());
+  const panel = new BrowserWindow({
+    title: "OpenPets chat",
+    width: size.width,
+    height: size.height,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    show: false,
+    hasShadow: false,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+      preload: join(projectRoot, "panel-preload.cjs"),
+      zoomFactor: 1,
+    },
   });
+  panel.setAlwaysOnTop(true, "floating");
+  panel.setMenu(null);
+  pet.panelWindow = panel;
+  panel.on("closed", () => {
+    if (pet.panelWindow === panel) pet.panelWindow = null;
+    if (!pet.window.isDestroyed()) {
+      pet.chatExpanded = false;
+      publishPanelState(pet);
+    }
+  });
+  // Esc and the in-panel close button both hide the panel; nothing about the
+  // pet or its session changes.
+  panel.webContents.on("before-input-event", (_event, input) => {
+    if (input.type === "keyDown" && input.key === "Escape") setChatExpanded(pet, false);
+  });
+  // Popconfirm semantics: clicking outside the panel dismisses it. This lives
+  // on the panel rather than on the pet because the panel owns focus while it
+  // is open; the pet blurs the moment the panel opens and must not count.
+  //
+  // The latch guards against the blur Chromium fires while the panel is still
+  // being activated for the first time, which otherwise closes the panel
+  // moments after opening it.
+  let panelHasFocused = false;
+  panel.on("focus", () => { panelHasFocused = true; });
+  panel.on("blur", () => {
+    if (!panelHasFocused) return;
+    if (!pet.chatExpanded) return;
+    // Give the click a chance to land on the pet (which toggles the panel
+    // itself) or on the panel again before deciding the user clicked away.
+    setTimeout(() => {
+      if (pet.window.isDestroyed() || !pet.chatExpanded) return;
+      if (panel.isDestroyed()) return;
+      if (panel.isFocused()) return;
+      const focused = BrowserWindow.getFocusedWindow();
+      if (focused !== null && focused === pet.window) return;
+      setChatExpanded(pet, false);
+    }, 120);
+  });
+  panel.webContents.on("console-message", (_event, level, message) => {
+    console.log(`[panel:${level}] ${message}`);
+  });
+  const dir = join(app.getPath("userData"), "rendered-pets");
+  void mkdir(dir, { recursive: true })
+    .then(() => {
+      const filePath = join(dir, `standalone-panel-${pet.window.webContents.id}.html`);
+      return writeFile(filePath, createPanelPageHtml({ petName: pet.petEntry.displayName }), "utf8").then(() => filePath);
+    })
+    .then((filePath) => panel.loadFile(filePath))
+    .catch((error) => console.error("panel page load failed", error));
+  return panel;
+}
+
+/**
+ * Show a Windows toast when a pet's turn finishes.
+ *
+ * No-ops when the notification API is unavailable (older Windows, notifications
+ * disabled) so a missing toast never breaks the turn pipeline.
+ */
+function notifyTurnDone(pet: PetInstance, label: string): void {
+  if (!Notification.isSupported()) return;
+  try {
+    const toast = new Notification({
+      title: `${pet.petEntry.displayName} 完成了任务`,
+      body: `${label}：已回复，点我查看对话`,
+      silent: false,
+    });
+    toast.on("click", () => {
+      if (pet.window.isDestroyed()) return;
+      setChatExpanded(pet, true);
+      pet.window.show();
+      pet.window.focus();
+    });
+    toast.show();
+  } catch (error) {
+    console.error("notification failed", error);
+  }
 }
 
 /** Human-readable pet label for a session, e.g. "my-project". */
@@ -304,6 +530,10 @@ function handleWatchStatus(update: { sessionID: string; status: "running" | "idl
   const pet = petForSession(update.sessionID);
   if (pet === undefined) return;
   const label = pet.sessionTitle ?? "session";
+  // Finished work is worth a Windows toast: the user may have switched away
+  // while the pet was thinking. Only terminal "succeeded" notifications fire;
+  // failures and interrupts already surface as a visible error pose.
+  if (update.kind === "succeeded") notifyTurnDone(pet, label);
   switch (update.kind) {
     case "enqueued":
       applyReaction(pet, "waving", `${label}: 收到你的消息`);
@@ -354,7 +584,11 @@ function startWatch(): void {
           fieldKeys: ask.fieldKeys,
         });
         const { sessionID: _ignored, ...card } = ask;
-        pet.window.webContents.send("openpets:pet-ask", card);
+        // The panel renders question forms now. Open it first so the user sees
+        // the options instead of a silently parked turn.
+        if (!pet.chatExpanded) setChatExpanded(pet, true);
+        const panel = pet.panelWindow;
+        if (panel !== null && !panel.isDestroyed()) panel.webContents.send("openpets:pet-ask", card);
         applyReaction(pet, "waiting", `${pet.sessionTitle ?? "session"}: 需要你确认`);
         return;
       }
@@ -540,34 +774,47 @@ async function runSummon(pet: PetInstance, request: SummonRequest): Promise<void
   publishPanelState(pet);
 }
 
-/** Expand/collapse one pet's window carrier for its chat panel (anchors the pet in place). */
+/**
+ * Show or hide a pet's floating chat panel.
+ *
+ * The pet window is deliberately untouched: it keeps its bounds, its z-order and
+ * its input behaviour. The panel is a separate always-on-top window positioned
+ * next to the pet, so opening the chat can never move or squeeze the pet.
+ */
 function setChatExpanded(pet: PetInstance, next: boolean): void {
-  const win = pet.window;
-  console.log(`[pet] setChatExpanded id=${win.webContents.id} next=${next} current=${pet.chatExpanded}`);
+  const petWin = pet.window;
+  if (petWin.isDestroyed()) return;
+  console.log(`[pet] setChatExpanded id=${petWin.webContents.id} next=${next} current=${pet.chatExpanded}`);
   if (pet.chatExpanded === next) return;
-  if (win.isDestroyed()) return;
   pet.chatExpanded = next;
-  const wasResizable = win.isResizable();
-  win.setResizable(true);
-  try {
-    if (next) {
-      const collapsed = win.getBounds();
-      const bounds = expandedBoundsFor({ x: collapsed.x, y: collapsed.y });
-      // Remember where the pet must reappear: its pre-expand origin plus any
-      // clamp shift, so collapsing restores the exact original spot.
-      pet.collapsedAnchor = { x: collapsed.x + bounds.petOffset.x, y: collapsed.y + bounds.petOffset.y };
-      win.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, false);
-    } else {
-      const anchor = pet.collapsedAnchor ?? (() => {
-        const bounds = win.getBounds();
-        return clampPointToWorkArea({ x: bounds.x, y: bounds.y + (collapsedWindowSize.height - bounds.height) }, collapsedWindowSize);
-      })();
-      win.setBounds({ ...anchor, width: collapsedWindowSize.width, height: collapsedWindowSize.height }, false);
+  if (next) {
+    const panel = ensurePanelWindow(pet);
+    if (panel === null) {
+      pet.chatExpanded = false;
+      return;
     }
-  } finally {
-    win.setResizable(wasResizable);
+    // Anchor on the sprite, not the whole carrier window: the window reserves a
+    // 90px strip above the sprite for the bubble plus an 8px margin, so using
+    // its raw bounds would push the panel noticeably away from the pet.
+    const anchor = petSpriteBounds(petWin.getBounds());
+    const size = panelSizeFor(anchor);
+    const area = workAreaForPoint({ x: anchor.x + Math.floor(anchor.width / 2), y: anchor.y + Math.floor(anchor.height / 2) });
+    const bounds = computePanelBounds(anchor, size, area);
+    console.log(`[pet] panel placement ${bounds.placement.side}/${bounds.placement.align} at ${JSON.stringify({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height })}`);
+    panel.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, false);
+    // Show with focus: `showInactive` left the panel unable to receive keyboard
+    // input, so the composer could never be typed into. The pet window itself
+    // keeps its own focus behavior; focusing the panel is what lets the user
+    // type immediately after opening it.
+    panel.show();
+    panel.focus();
+    panel.webContents.send("openpets:pet-panel-state", {
+      chatExpanded: true,
+      sessionTitle: pet.sessionTitle ?? "",
+    });
+  } else if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
+    pet.panelWindow.hide();
   }
-  console.log(`[pet] chat bounds now ${JSON.stringify(win.getBounds())}`);
   publishPanelState(pet);
 }
 
@@ -628,7 +875,9 @@ async function pickPetEntryForNewWindow(): Promise<PetStoreEntry> {
 }
 
 function bottomRightPosition(width: number, height: number): { x: number; y: number } {
-  const display = screen.getPrimaryDisplay().workArea;
+  // Place a brand-new pet on the display that owns the cursor, so creating one
+  // while working on a secondary monitor does not drop it on the primary screen.
+  const display = workAreaForPoint(screen.getCursorScreenPoint());
   return {
     x: display.x + display.width - width - 24,
     y: display.y + display.height - height - 8,
@@ -639,6 +888,49 @@ function bottomRightPosition(width: number, height: number): { x: number; y: num
  * Show one pet's own right-click menu. Items are built lazily so model and
  * session lists always reflect the live server state.
  */
+/**
+ * Delete every session whose transcript is empty, then report the count.
+ *
+ * Uses `DELETE /api/session/{id}` (`session.remove`), which removes the session
+ * and its child sessions. Everything else in the list is untouched: empty means
+ * `readTimeline` returned zero messages.
+ *
+ * Safety: the pet's bound session is skipped so the open chat keeps working,
+ * and any session the SSE watcher reports as running is skipped so a live turn
+ * is never yanked out from under the user.
+ */
+async function cleanupEmptySessions(pet: PetInstance): Promise<void> {
+  const target = pet.endpoint ?? (await discoverService());
+  if (target === undefined) {
+    say(pet, "OpenCode 未连接");
+    return;
+  }
+  pet.endpoint = target;
+  const sessions = await listSessions(target).catch(() => undefined);
+  if (sessions === undefined) {
+    say(pet, "读取会话列表失败");
+    return;
+  }
+  let removed = 0;
+  let failed = 0;
+  for (const session of sessions) {
+    if (session.id === pet.sessionID) continue;
+    if (watch?.get(session.id)?.status === "running") continue;
+    const timeline = await readTimeline(target, session.id).catch(() => undefined);
+    if (timeline === undefined || timeline.length > 0) continue;
+    try {
+      await deleteSession(target, session.id);
+      removed += 1;
+    } catch (error) {
+      failed += 1;
+      console.log(`[cleanup] delete failed session=${session.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const detail = failed > 0 ? `，失败 ${failed} 个` : "";
+  say(pet, `已删除空会话 ${removed} 个${detail}`);
+  publishPanelState(pet);
+}
+
 async function showPetContextMenu(pet: PetInstance): Promise<void> {
   const win = pet.window;
   if (win.isDestroyed()) return;
@@ -734,6 +1026,13 @@ async function showPetContextMenu(pet: PetInstance): Promise<void> {
       },
     },
     { label: "选择 session", submenu: sessionItems },
+    {
+      label: "清理无效会话",
+      enabled: target !== undefined,
+      click: () => {
+        void cleanupEmptySessions(pet);
+      },
+    },
     { type: "separator" },
     { label: "关闭宠物", click: () => { win.hide(); } },
   ]);
@@ -785,15 +1084,15 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
     revertTimer: null,
     idleRevertTimer: null,
     chatExpanded: false,
-    collapsedAnchor: null,
+    panelWindow: null,
   };
   pets.set(window.webContents.id, pet);
   focusedPetId = window.webContents.id;
-  // Hide the chat panel when the pet window loses focus. `setChatExpanded`
-  // returns early when already collapsed, so this is a no-op most of the time.
-  window.on("blur", () => {
-    if (pet.chatExpanded) setChatExpanded(pet, false);
-  });
+  // NOTE: the pet window intentionally does NOT close the panel on blur. The
+  // panel is a separate window that takes focus when it opens, so a pet blur
+  // fires immediately on open and used to close the panel instantly (the
+  // "flash then vanish" bug). Dismissing on outside clicks is handled by the
+  // panel window's own blur handler in ensurePanelWindow().
   window.on("focus", () => {
     focusedPetId = window.webContents.id;
   });
@@ -820,6 +1119,9 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
   window.on("closed", () => {
     if (pet.revertTimer) clearTimeout(pet.revertTimer);
     if (pet.idleRevertTimer) clearTimeout(pet.idleRevertTimer);
+    // The panel is a separate window, so closing the pet must close it too.
+    if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) pet.panelWindow.destroy();
+    pet.panelWindow = null;
     pets.delete(window.webContents.id);
     if (focusedPetId === window.webContents.id) focusedPetId = undefined;
   });
@@ -956,16 +1258,22 @@ function installIpc(): void {
     event.sender.send("openpets:pet-state", { state: pet.lastSpriteState, message });
   });
   ipcMain.on("openpets:pet-chat-toggle", (event) => {
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     if (pet === undefined) return;
     setChatExpanded(pet, !pet.chatExpanded);
+  });
+  // The panel's own close button and Esc both route here.
+  ipcMain.on("openpets:panel-close", (event) => {
+    const pet = petForPanelSender(event.sender);
+    if (pet === undefined) return;
+    setChatExpanded(pet, false);
   });
   // Full projected transcript for the bound session, oldest first. The panel
   // calls this on open so the first paint shows real OpenCode history.
   ipcMain.handle("openpets:pet-chat-history", async (event) => {
     // Always report the bound session's title so the panel header can show it
     // even when there is no history yet (a brand-new session).
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     const sessionTitle = pet?.sessionTitle ?? "";
     if (pet === undefined) return { ok: false, error: "宠物已关闭", sessionTitle, messages: [] };
     if (pet.endpoint === undefined) return { ok: false, error: "OpenCode 未连接", sessionTitle, messages: [] };
@@ -977,7 +1285,7 @@ function installIpc(): void {
   // The chat panel shows the model the bound session actually runs on, so the
   // user can tell whether a switch took effect without opening OpenCode.
   ipcMain.handle("openpets:pet-chat-model", async (event) => {
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     if (pet === undefined) return { ok: false, label: "宠物已关闭" };
     if (pet.endpoint === undefined) return { ok: false, label: "OpenCode 未连接" };
     if (pet.sessionID === undefined) return { ok: false, label: "未绑定会话" };
@@ -990,7 +1298,7 @@ function installIpc(): void {
     const text = typeof raw === "string" ? raw.trim() : "";
     if (!text) return { ok: false, error: "消息为空" };
     if (text.length > 4000) return { ok: false, error: "消息太长（上限 4000 字）" };
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     if (pet === undefined) return { ok: false, error: "宠物已关闭" };
     const sessionID = pet.sessionID;
     if (sessionID === undefined) return { ok: false, error: "当前宠物还没有绑定会话，请稍候或重新召唤" };
@@ -1016,8 +1324,9 @@ function installIpc(): void {
     // still running; the panel answers by sending the chosen label back as the
     // next prompt, which is how `opencode run` resumes that turn.
     return await runPrompt(sessionID, text, directory, model === undefined ? undefined : { providerID: model.providerID, id: model.id }, (ask) => {
-      if (pet.window.isDestroyed()) return;
-      pet.window.webContents.send("openpets:pet-ask", ask);
+      const panel = pet.panelWindow;
+      if (panel === null || panel.isDestroyed()) return;
+      panel.webContents.send("openpets:pet-ask", ask);
       // A non-interactive CLI run cancels the question immediately and lets
       // the model free-wheel through "reasonable assumptions" — the pet must
       // not look like it is asking and answering itself. Interrupt the
@@ -1034,7 +1343,7 @@ function installIpc(): void {
     const formID = typeof record.formID === "string" ? record.formID : "";
     const pending = pendingForms.get(formID);
     if (pending === undefined) return { ok: false, error: "问题已失效" };
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     if (pet === undefined) return { ok: false, error: "宠物已关闭" };
     if (pet.sessionID !== pending.sessionID) return { ok: false, error: "会话不匹配" };
     const answers = Array.isArray(record.answers) ? record.answers : [];
@@ -1057,7 +1366,7 @@ function installIpc(): void {
   // The session stays bound and usable afterwards.
   ipcMain.handle("openpets:pet-chat-stop", async (event) => {
     const killedLocal = abortRunPrompt();
-    const pet = petForSender(event.sender);
+    const pet = petForPanelSender(event.sender);
     if (pet !== undefined && pet.endpoint !== undefined && pet.sessionID !== undefined) {
       await requestInterrupt(pet.endpoint, pet.sessionID).catch(() => undefined);
     }

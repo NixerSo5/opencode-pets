@@ -45,7 +45,7 @@
 - question 卡片：预置选项 + 手填，多问题一次提交，同回合续跑
 - Markdown 渲染与代码块语法高亮，排队发送，停止
 - 对话文本可选中复制；每条卡片右下角复制按钮（走主进程 clipboard）
-- electron-builder 打包：OpenPets Setup 1.0.0.exe（NSIS）与 OpenPets 1.0.0.exe（portable）
+- electron-builder 打包：OpenPets Setup 1.1.0.exe（NSIS）与 OpenPets 1.1.0.exe（portable）
 
 ### 待办
 

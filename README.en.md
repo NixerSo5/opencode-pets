@@ -45,7 +45,7 @@ Usable. The main path is verified on a real machine.
 - Question cards: preset options plus free text, multiple questions submitted at once, same turn resumes
 - Markdown rendering with code-block highlighting, queued sending, stop
 - Selectable transcript; per-card copy button in the bottom-right (via main-process clipboard)
-- electron-builder output: OpenPets Setup 1.0.0.exe (NSIS) and OpenPets 1.0.0.exe (portable)
+- electron-builder output: OpenPets Setup 1.1.0.exe (NSIS) and OpenPets 1.1.0.exe (portable)
 
 ### Todo
 

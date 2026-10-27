@@ -95,6 +95,16 @@ export async function getSessionAfterModelSwitch(endpoint, sessionID, expected) 
     }
     return session;
 }
+/**
+ * Delete a session and its child sessions (`operationId: session.remove`).
+ *
+ * `DELETE /api/session/{id}` answers 204, or 404 with SessionNotFoundError when
+ * the id is unknown. Declared in /openapi.json even though probing a made-up id
+ * looks like a missing route.
+ */
+export async function deleteSession(endpoint, sessionID) {
+    await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}`, { method: "DELETE" });
+}
 /** All sessions known to the server, newest first (as the server returns them). */
 export async function listSessions(endpoint) {
     const body = await request(endpoint, "/api/session");
