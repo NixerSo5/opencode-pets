@@ -183,6 +183,174 @@ export async function sendPrompt(endpoint: ServiceEndpoint, sessionID: string, p
 }
 
 /**
+ * Pending interaction the agent is blocked on.
+ *
+ * `permission` is a tool asking "may I run this?" (once / always / reject).
+ * `form` is the `question` tool: a structured set of fields with options, which
+ * is what the chat panel renders as clickable buttons.
+ */
+export interface PermissionRequest {
+  readonly id: string;
+  readonly sessionID: string;
+  readonly tool?: string;
+  readonly title?: string;
+  readonly description?: string;
+}
+
+export interface FormOption {
+  readonly value: string;
+  readonly label: string;
+  readonly description?: string;
+}
+
+export interface FormField {
+  readonly key: string;
+  readonly type: string;
+  readonly label?: string;
+  readonly description?: string;
+  readonly required?: boolean;
+  readonly options?: readonly FormOption[];
+}
+
+export interface FormRequest {
+  readonly id: string;
+  readonly sessionID: string;
+  readonly title?: string;
+  readonly fields: readonly FormField[];
+}
+
+/** Permissions the session is currently blocked on (empty when none). */
+export async function listPermissions(endpoint: ServiceEndpoint, sessionID: string): Promise<PermissionRequest[]> {
+  const body = await request<{ data: Array<Record<string, unknown>> }>(endpoint, `/api/session/${encodeURIComponent(sessionID)}/permission`);
+  return (body.data ?? []).map((row) => ({
+    id: typeof row.id === "string" ? row.id : "",
+    sessionID: typeof row.sessionID === "string" ? row.sessionID : sessionID,
+    tool: typeof row.tool === "string" ? row.tool : undefined,
+    title: typeof row.title === "string" ? row.title : undefined,
+    description: typeof row.description === "string" ? row.description : undefined,
+  })).filter((row) => row.id.length > 0);
+}
+
+/** Form (`question` tool) requests the session is currently blocked on. */
+export async function listForms(endpoint: ServiceEndpoint, sessionID: string): Promise<FormRequest[]> {
+  const body = await request<{ data: Array<Record<string, unknown>> }>(endpoint, `/api/session/${encodeURIComponent(sessionID)}/form`);
+  const rows: FormRequest[] = [];
+  for (const row of body.data ?? []) {
+    if (typeof row.id !== "string" || row.id.length === 0) continue;
+    const rawFields = Array.isArray(row.fields) ? row.fields : [];
+    const fields: FormField[] = [];
+    for (const raw of rawFields) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const field = raw as Record<string, unknown>;
+      if (typeof field.key !== "string") continue;
+      const options = Array.isArray(field.options)
+        ? field.options.flatMap((option) => {
+            if (typeof option !== "object" || option === null) return [];
+            const entry = option as Record<string, unknown>;
+            if (typeof entry.value !== "string") return [];
+            return [{ value: entry.value, label: typeof entry.label === "string" ? entry.label : entry.value, description: typeof entry.description === "string" ? entry.description : undefined }];
+          })
+        : undefined;
+      fields.push({
+        key: field.key,
+        type: typeof field.type === "string" ? field.type : "string",
+        label: typeof field.label === "string" ? field.label : undefined,
+        description: typeof field.description === "string" ? field.description : undefined,
+        required: field.required === true,
+        options,
+      });
+    }
+    rows.push({
+      id: row.id,
+      sessionID: typeof row.sessionID === "string" ? row.sessionID : sessionID,
+      title: typeof row.title === "string" ? row.title : undefined,
+      fields,
+    });
+  }
+  return rows;
+}
+
+/** Answer a permission prompt. `decision` is once / always / reject. */
+export async function replyPermission(
+  endpoint: ServiceEndpoint,
+  sessionID: string,
+  requestID: string,
+  decision: "once" | "always" | "reject",
+): Promise<void> {
+  await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/permission/${encodeURIComponent(requestID)}/reply`, {
+    method: "POST",
+    body: JSON.stringify({ decision }),
+  });
+}
+
+/**
+ * Answer a form (`question` tool) with one value per field key.
+ *
+ * This is how the OpenCode web dock replies: the whole form in one call, and
+ * the agent stays parked on it until the answer arrives. Form field keys are
+ * `q0`, `q1`, … in question order.
+ */
+export async function replyForm(
+  endpoint: ServiceEndpoint,
+  sessionID: string,
+  formID: string,
+  answer: Record<string, string>,
+): Promise<void> {
+  await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}/reply`, {
+    method: "POST",
+    body: JSON.stringify({ answer }),
+  });
+}
+
+/**
+ * Decode an SSE `form.created` event into the panel's ask shape.
+ *
+ * Event payload (verified against a local 2.1.4 server):
+ * `{ type: "form.created", data: { form: { id, sessionID, title, metadata.kind,
+ * fields: [{ key, title, description, type, options: [{ value, label, description }] }] } } }`.
+ */
+export function parseFormCreated(raw: unknown): (AskEvent & { formID: string; sessionID: string; fieldKeys: readonly string[] }) | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const event = raw as Record<string, unknown>;
+  const data = typeof event.data === "object" && event.data !== null ? (event.data as Record<string, unknown>) : undefined;
+  const form = typeof data?.form === "object" && data.form !== null ? (data.form as Record<string, unknown>) : undefined;
+  if (form === undefined) return undefined;
+  const formID = typeof form.id === "string" ? form.id : "";
+  const sessionID = typeof form.sessionID === "string" ? form.sessionID : "";
+  if (formID.length === 0 || sessionID.length === 0) return undefined;
+  const rawFields = Array.isArray(form.fields) ? form.fields : [];
+  const questions: AskEvent["questions"] = [];  for (const rawField of rawFields) {
+    if (typeof rawField !== "object" || rawField === null) continue;
+    const field = rawField as Record<string, unknown>;
+    const question = typeof field.description === "string" ? field.description : typeof field.label === "string" ? field.label : "";
+    if (question.length === 0) continue;
+    const options: AskEvent["questions"][number]["options"] = [];
+    for (const rawOption of Array.isArray(field.options) ? field.options : []) {
+      if (typeof rawOption !== "object" || rawOption === null) continue;
+      const entry = rawOption as Record<string, unknown>;
+      if (typeof entry.value !== "string") continue;
+      options.push({
+        label: typeof entry.label === "string" && entry.label.length > 0 ? entry.label : entry.value,
+        value: entry.value,
+        description: typeof entry.description === "string" ? entry.description : undefined,
+      });
+    }
+    questions.push({
+      header: typeof field.title === "string" && field.title.length > 0 ? field.title : undefined,
+      question,
+      multiple: field.type === "multiselect",
+      options,
+    });
+  }
+  if (questions.length === 0) return undefined;
+  const fieldKeys = rawFields
+    .map((field) => (typeof field === "object" && field !== null ? (field as Record<string, unknown>) : undefined))
+    .map((field) => (field !== undefined && typeof field.key === "string" ? field.key : undefined))
+    .filter((key): key is string => key !== undefined);
+  return { formID, sessionID, fieldKeys, questions };
+}
+
+/**
  * Run one turn through the real CLI (`opencode run`), which is what the user
  * does interactively. The v2 HTTP `prompt` endpoint only steers an already
  * running agent, so it never executes anything on an idle session.
@@ -239,11 +407,77 @@ export function abortRunPrompt(): boolean {
   return true;
 }
 
+/** A `question` tool call surfaced from the CLI JSON stream, or resolved from an SSE `form.created` event. */
+export interface AskEvent {
+  readonly callID?: string;
+  /**
+   * Set only when the ask came from the HTTP event stream: the agent is
+   * genuinely parked on this form until `replyForm` answers it, so the panel
+   * submits through the form endpoint instead of appending a follow-up prompt.
+   */
+  readonly formID?: string;
+  readonly questions: Array<{
+    readonly header?: string;
+    readonly question: string;
+    readonly multiple?: boolean;
+    readonly options: Array<{ readonly label: string; readonly description?: string; readonly value?: string }>;
+  }>;
+}
+
+/**
+ * Detect the CLI event that carries a `question` tool call.
+ *
+ * `opencode run --format json` emits one object per line. A tool call arrives
+ * with `type: "tool"` (older builds use `tool_use` / `tool.call`) and the tool
+ * name lives on `part.tool`; the arguments — including the `questions` array —
+ * are under `part.state.input` once the call is pending.
+ */
+function isQuestionEvent(event: { type?: string; part?: Record<string, unknown> }): boolean {
+  const type = event.type ?? "";
+  if (type !== "tool" && type !== "tool_use" && type !== "tool.call") return false;
+  const part = event.part ?? {};
+  const tool = typeof part.tool === "string" ? part.tool : typeof part.name === "string" ? part.name : "";
+  return tool === "question" || tool === "ask";
+}
+
+/** Pull the `questions` array out of a question tool event, tolerating shapes. */
+function readAskEvent(event: { part?: Record<string, unknown> }): AskEvent {
+  const part = event.part ?? {};
+  const state = typeof part.state === "object" && part.state !== null ? (part.state as Record<string, unknown>) : undefined;
+  const rawInput = state?.input ?? part.input ?? part.args;
+  const input = typeof rawInput === "object" && rawInput !== null ? (rawInput as Record<string, unknown>) : {};
+  const rawQuestions = Array.isArray(input.questions) ? input.questions : Array.isArray(input.question) ? input.question : [];
+  const questions: AskEvent["questions"] = [];
+  for (const raw of rawQuestions) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const row = raw as Record<string, unknown>;
+    const questionText = typeof row.question === "string" ? row.question : "";
+    if (questionText.length === 0) continue;
+    const rawOptions = Array.isArray(row.options) ? row.options : [];
+    const options: Array<{ label: string; description?: string }> = [];
+    for (const option of rawOptions) {
+      if (typeof option !== "object" || option === null) continue;
+      const entry = option as Record<string, unknown>;
+      const label = typeof entry.label === "string" ? entry.label : typeof entry.value === "string" ? entry.value : "";
+      if (label.length === 0) continue;
+      options.push({ label, description: typeof entry.description === "string" ? entry.description : undefined });
+    }
+    questions.push({
+      header: typeof row.header === "string" ? row.header : undefined,
+      question: questionText,
+      multiple: row.multiple === true,
+      options,
+    });
+  }
+  return { callID: typeof part.callID === "string" ? part.callID : typeof part.id === "string" ? part.id : undefined, questions };
+}
+
 export async function runPrompt(
   sessionID: string,
   prompt: string,
   directory?: string,
   model?: { providerID: string; id: string },
+  onAsk?: (ask: AskEvent) => void,
 ): Promise<RunPromptResult> {
   const cli = resolveCliPath();
   const args = ["run", "-s", sessionID, "--format", "json", "--auto"];
@@ -276,6 +510,15 @@ export async function runPrompt(
     }
     activeRuns.add(child);
     const texts: string[] = [];
+    // The CLI prints every tool event twice (the live stream plus a final
+    // reconcile pass re-emits the same part), so dedupe ask cards by call id;
+    // otherwise each question renders twice in the panel.
+    const askCallIDs = new Set<string>();
+    // Set once a question surfaces. A non-interactive CLI run instantly
+    // cancels its question tool and the model then free-wheels through
+    // "reasonable assumptions" on its own; everything it says after the
+    // question is that noise, so it must not reach the panel or the reply.
+    let askPending = false;
     let stderr = "";
     let buffer = "";
     const drain = (chunk: string): void => {
@@ -286,9 +529,27 @@ export async function runPrompt(
         buffer = buffer.slice(index + 1);
         if (line.startsWith("{")) {
           try {
-            const event = JSON.parse(line) as { type?: string; part?: { type?: string; text?: string }; error?: unknown };
-            if (event.type === "text" && typeof event.part?.text === "string" && event.part.text.length > 0) texts.push(event.part.text);
+            const event = JSON.parse(line) as { type?: string; part?: Record<string, unknown>; error?: unknown };
+            if (event.type === "text" && typeof event.part?.text === "string" && event.part.text.length > 0 && !askPending) texts.push(event.part.text);
             if (event.type === "error" && event.error !== undefined) stderr += `\n${JSON.stringify(event.error).slice(0, 400)}`;
+            // A `question` tool call is the interactive ask the panel renders as
+            // buttons. Log any non-text event so the real field names are visible
+            // instead of guessed at.
+            if (event.type !== "text" && event.type !== "step_start" && event.type !== "step_finish") {
+              console.log(`[opencode-run][event] ${line.slice(0, 2000)}`);
+            }
+            if (onAsk !== undefined && isQuestionEvent(event)) {
+              const ask = readAskEvent(event);
+              // The CLI re-emits every tool event on its final reconcile pass,
+              // so the same question arrives twice; dedupe by call id or the
+              // panel stacks two cards.
+              if (ask.callID !== undefined) {
+                if (askCallIDs.has(ask.callID)) continue;
+                askCallIDs.add(ask.callID);
+              }
+              askPending = true;
+              if (ask.questions.length > 0) onAsk(ask);
+            }
           } catch {
             // Partial or non-JSON line: ignore.
           }
@@ -315,7 +576,11 @@ export async function runPrompt(
       const wasActive = activeRuns.delete(child);
       if (buffer.trim().startsWith("{")) drain("\n");
       const reply = texts.join("").trim();
-      if (reply.length > 0) resolve({ ok: true, reply });
+      // The turn hit a question: the reply (if any) was the model's own
+      // cancelled-question noise and the caller parks on the card until the
+      // user submits. Report success with no text instead of an error bubble.
+      if (askPending) resolve({ ok: true, reply: "" });
+      else if (reply.length > 0) resolve({ ok: true, reply });
       else if (!wasActive) resolve({ ok: false, error: "已停止思考" });
       else if (code === 0) resolve({ ok: false, error: "OpenCode 没有返回文本" });
       else resolve({ ok: false, error: `opencode run 退出码 ${String(code)}${stderr.trim().length > 0 ? `：${stderr.trim().slice(0, 400)}` : ""}` });
@@ -345,7 +610,7 @@ type RawMessage = {
   text?: string;
   content?: Array<{ type: string; text?: string }>;
   parts?: Array<{ type: string; text?: string }>;
-  time?: { created?: number };
+  time?: { created?: number; completed?: number };
   outcome?: string;
   error?: { message?: string };
   /** Auto-retry state: the error lives under `retry.error`, not `error`. */
@@ -401,4 +666,41 @@ export async function readTimeline(endpoint: ServiceEndpoint, sessionID: string)
     return [{ id: message.id, role, text, time: message.time?.created, ...(error === undefined ? {} : { error }) }];
   });
   return rows.reverse();
+}
+
+/**
+ * Final outcome of a turn started at or after `sinceMs`, or `undefined` while
+ * it is still running.
+ *
+ * The projected timeline marks a finished assistant message with
+ * `time.completed` (verified live); a turn the user stopped never completes, so
+ * an interrupt surfaces through the SSE watcher instead of this poll.
+ */
+export async function turnResultAfter(endpoint: ServiceEndpoint, sessionID: string, sinceMs: number): Promise<RunPromptResult | undefined> {
+  const body = await request<{ data: RawMessage[] }>(endpoint, `/api/session/${encodeURIComponent(sessionID)}/message`);
+  const rows = body.data ?? [];
+  let error: string | undefined;
+  let reply: string | undefined;
+  let sawNewTurn = false;
+  // Newest first: stop scanning as soon as rows predate the turn.
+  for (const message of rows) {
+    const created = message.time?.created;
+    if (typeof created !== "number" || created < sinceMs) break;
+    if (message.type === "assistant") {
+      if (error === undefined) error = describeError(message);
+      if (reply === undefined && typeof message.time?.completed === "number") {
+        const blocks = message.content ?? message.parts ?? [];
+        reply = blocks.filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text as string).join("").trim();
+      }
+      sawNewTurn = true;
+    } else if (message.type === "idle" && error === undefined) {
+      error = describeError(message);
+      if (error !== undefined) sawNewTurn = true;
+    }
+  }
+  if (!sawNewTurn) return undefined;
+  if (error !== undefined) return { ok: false, error: `OpenCode 报错：${error}` };
+  if (reply !== undefined && reply.length > 0) return { ok: true, reply };
+  // Turn messages exist but none has completed yet: still running.
+  return undefined;
 }

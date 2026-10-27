@@ -1,0 +1,21 @@
+Windows Registry Editor Version 5.00
+
+; OpenPets: "召唤宠物" entry for Explorer right-click.
+; Applies to the desktop background and to the empty space inside any folder.
+; Edit the two command paths below if the project directory moves.
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\OpenPetsSummon]
+@="召唤宠物"
+"Icon"="C:\\Users\\nixer\\Desktop\\pet-animation-standalone\\assets\\assets\\app-icon.ico"
+"Position"="top"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\OpenPetsSummon\command]
+@="\"C:\\Users\\nixer\\Desktop\\pet-animation-standalone\\pet-launch.cmd\" \"%V\" 0 0"
+
+[HKEY_CURRENT_USER\Software\Classes\DesktopBackground\Shell\OpenPetsSummon]
+@="召唤宠物"
+"Icon"="C:\\Users\\nixer\\Desktop\\pet-animation-standalone\\assets\\assets\\app-icon.ico"
+"Position"="top"
+
+[HKEY_CURRENT_USER\Software\Classes\DesktopBackground\Shell\OpenPetsSummon\command]
+@="\"C:\\Users\\nixer\\Desktop\\pet-animation-standalone\\pet-launch.cmd\" \"%V\" 0 0"

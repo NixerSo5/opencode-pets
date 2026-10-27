@@ -13,9 +13,53 @@
     "@types/node": "^25.6.2",
     "@types/yauzl": "^3.4.0",
     "electron": "^42.0.0",
+    "electron-builder": "^26.0.0",
     "typescript": "^6.0.3"
   },
   "dependencies": {
     "yauzl": "^3.4.0"
+  },
+  "build": {
+    "appId": "com.openpets.desktop",
+    "productName": "OpenPets",
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "files": [
+      "dist/**/*",
+      "pet-preload.cjs",
+      "management-preload.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets",
+        "to": "assets"
+      },
+      {
+        "from": "pet-launch.cmd",
+        "to": "pet-launch.cmd"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/assets/app-icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh"
+    }
   }
 }

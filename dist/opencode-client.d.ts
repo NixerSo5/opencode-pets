@@ -94,6 +94,65 @@ export declare function activeSessions(endpoint: ServiceEndpoint): Promise<Recor
 /** Admit one user prompt; the agent loop starts unless `resume` is false. */
 export declare function sendPrompt(endpoint: ServiceEndpoint, sessionID: string, prompt: string): Promise<void>;
 /**
+ * Pending interaction the agent is blocked on.
+ *
+ * `permission` is a tool asking "may I run this?" (once / always / reject).
+ * `form` is the `question` tool: a structured set of fields with options, which
+ * is what the chat panel renders as clickable buttons.
+ */
+export interface PermissionRequest {
+    readonly id: string;
+    readonly sessionID: string;
+    readonly tool?: string;
+    readonly title?: string;
+    readonly description?: string;
+}
+export interface FormOption {
+    readonly value: string;
+    readonly label: string;
+    readonly description?: string;
+}
+export interface FormField {
+    readonly key: string;
+    readonly type: string;
+    readonly label?: string;
+    readonly description?: string;
+    readonly required?: boolean;
+    readonly options?: readonly FormOption[];
+}
+export interface FormRequest {
+    readonly id: string;
+    readonly sessionID: string;
+    readonly title?: string;
+    readonly fields: readonly FormField[];
+}
+/** Permissions the session is currently blocked on (empty when none). */
+export declare function listPermissions(endpoint: ServiceEndpoint, sessionID: string): Promise<PermissionRequest[]>;
+/** Form (`question` tool) requests the session is currently blocked on. */
+export declare function listForms(endpoint: ServiceEndpoint, sessionID: string): Promise<FormRequest[]>;
+/** Answer a permission prompt. `decision` is once / always / reject. */
+export declare function replyPermission(endpoint: ServiceEndpoint, sessionID: string, requestID: string, decision: "once" | "always" | "reject"): Promise<void>;
+/**
+ * Answer a form (`question` tool) with one value per field key.
+ *
+ * This is how the OpenCode web dock replies: the whole form in one call, and
+ * the agent stays parked on it until the answer arrives. Form field keys are
+ * `q0`, `q1`, … in question order.
+ */
+export declare function replyForm(endpoint: ServiceEndpoint, sessionID: string, formID: string, answer: Record<string, string>): Promise<void>;
+/**
+ * Decode an SSE `form.created` event into the panel's ask shape.
+ *
+ * Event payload (verified against a local 2.1.4 server):
+ * `{ type: "form.created", data: { form: { id, sessionID, title, metadata.kind,
+ * fields: [{ key, title, description, type, options: [{ value, label, description }] }] } } }`.
+ */
+export declare function parseFormCreated(raw: unknown): (AskEvent & {
+    formID: string;
+    sessionID: string;
+    fieldKeys: readonly string[];
+}) | undefined;
+/**
  * Run one turn through the real CLI (`opencode run`), which is what the user
  * does interactively. The v2 HTTP `prompt` endpoint only steers an already
  * running agent, so it never executes anything on an idle session.
@@ -108,10 +167,30 @@ export interface RunPromptResult {
 }
 /** Kill every in-flight `opencode run`. Resolves true when at least one was killed. */
 export declare function abortRunPrompt(): boolean;
+/** A `question` tool call surfaced from the CLI JSON stream, or resolved from an SSE `form.created` event. */
+export interface AskEvent {
+    readonly callID?: string;
+    /**
+     * Set only when the ask came from the HTTP event stream: the agent is
+     * genuinely parked on this form until `replyForm` answers it, so the panel
+     * submits through the form endpoint instead of appending a follow-up prompt.
+     */
+    readonly formID?: string;
+    readonly questions: Array<{
+        readonly header?: string;
+        readonly question: string;
+        readonly multiple?: boolean;
+        readonly options: Array<{
+            readonly label: string;
+            readonly description?: string;
+            readonly value?: string;
+        }>;
+    }>;
+}
 export declare function runPrompt(sessionID: string, prompt: string, directory?: string, model?: {
     providerID: string;
     id: string;
-}): Promise<RunPromptResult>;
+}, onAsk?: (ask: AskEvent) => void): Promise<RunPromptResult>;
 /** Stop the running agent loop for a session (used when the pet is dismissed). */
 export declare function interruptSession(endpoint: ServiceEndpoint, sessionID: string): Promise<void>;
 export interface TimelineEntry {
@@ -133,3 +212,12 @@ export interface TimelineEntry {
  * so the flattened rows are reversed here once.
  */
 export declare function readTimeline(endpoint: ServiceEndpoint, sessionID: string): Promise<TimelineEntry[]>;
+/**
+ * Final outcome of a turn started at or after `sinceMs`, or `undefined` while
+ * it is still running.
+ *
+ * The projected timeline marks a finished assistant message with
+ * `time.completed` (verified live); a turn the user stopped never completes, so
+ * an interrupt surfaces through the SSE watcher instead of this poll.
+ */
+export declare function turnResultAfter(endpoint: ServiceEndpoint, sessionID: string, sinceMs: number): Promise<RunPromptResult | undefined>;

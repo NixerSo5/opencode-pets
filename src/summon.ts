@@ -46,14 +46,24 @@ function readNumber(args: readonly string[], flag: string): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * A static Explorer verb cannot read the click position, so pet-launch.cmd
+ * always passes `0 0`. Treat the origin as "no position given" and let the
+ * caller fall back to the real cursor location.
+ */
+function readCursorCoord(args: readonly string[], flag: string): number | undefined {
+  const value = readNumber(args, flag);
+  return value === 0 ? undefined : value;
+}
+
 /** Parse argv (without the electron/exe prefix). Returns undefined when not a summon. */
 export function parseSummonRequest(argv: readonly string[]): SummonRequest | undefined {
   if (!argv.includes(SUMMON_FLAG)) return undefined;
   const dirIndex = argv.indexOf("--dir");
   return {
     directory: resolveDirectory(dirIndex === -1 ? undefined : argv[dirIndex + 1]),
-    x: readNumber(argv, "--x"),
-    y: readNumber(argv, "--y"),
+    x: readCursorCoord(argv, "--x"),
+    y: readCursorCoord(argv, "--y"),
   };
 }
 

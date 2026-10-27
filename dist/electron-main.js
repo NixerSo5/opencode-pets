@@ -6,7 +6,7 @@
  * only that tab) in a normal management window.
  */
 import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog } from "electron";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createPetPageHtml } from "./desktop-render.js";
@@ -16,7 +16,7 @@ import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
 import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, } from "./pet-store.js";
 import { pickReactionMessage } from "./reaction-messages.js";
-import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, readTimeline, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, } from "./opencode-client.js";
+import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, parseFormCreated, readTimeline, replyForm, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, turnResultAfter, } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
@@ -26,70 +26,105 @@ const reactionSchedule = [
     "idle", "thinking", "working", "testing", "waiting", "success", "error", "celebrating", "waving", "idle",
 ];
 const stateRows = getConfiguredSpriteStates(1010);
-let mainWindow = null;
 let managementWindow = null;
 let tray = null;
-let revertTimer = null;
 let scheduleIndex = 0;
-let lastSpriteState = "idle";
 let currentPetEntry = { ...builtInPetEntry, spritesheetPath: "", builtIn: true };
-/** Chat carrier state (original expandedPetWindowSize behavior). */
-let chatExpanded = false;
-let collapsedAnchor = null;
-/** OpenCode wiring: one pet window, one session (milestone 1). */
-let endpoint;
-let activeSessionID;
-let activeSessionTitle;
+/** Rotating counter so each newly summoned pet picks a different appearance. */
+let nextPetEntryIndex = 0;
+/** Keyed by `webContents.id`, which every IPC event carries. */
+const pets = new Map();
+/** Shared SSE watcher: fans every session event out to the pet that owns it. */
 let watch;
-let pendingSummon;
+/** Summons that arrived before their window finished loading. */
+const pendingSummons = new Map();
+function petById(id) {
+    return pets.get(id);
+}
+/** Resolve the pet that sent an IPC message (undefined when the window is gone). */
+function petForSender(sender) {
+    return pets.get(sender.id);
+}
+function anyPet() {
+    const first = pets.values().next();
+    return first.done === true ? undefined : first.value;
+}
+/** The pet the user interacted with last, used by tray actions. */
+let focusedPetId;
+function focusedPet() {
+    if (focusedPetId !== undefined) {
+        const found = pets.get(focusedPetId);
+        if (found !== undefined)
+            return found;
+    }
+    return anyPet();
+}
 const collapsedWindowSize = { width: 320, height: 300 };
-const expandedWindowSize = { width: 420, height: 640 };
+// Chat carrier: nominal 1.5x the original 420x640, but clamped to the work area
+// so the pet never gets pushed off its spot on small screens.
+const NOMINAL_EXPANDED_SIZE = { width: 630, height: 960 };
+function computeExpandedWindowSize() {
+    const area = screen.getPrimaryDisplay().workArea;
+    return {
+        width: Math.min(NOMINAL_EXPANDED_SIZE.width, area.width - 8),
+        height: Math.min(NOMINAL_EXPANDED_SIZE.height, area.height - 8),
+    };
+}
 const distDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(distDir, "..");
-const spritesheetPath = join(projectRoot, "assets", "assets", "default-pet-spritesheet.webp");
-const trayIconPath = join(projectRoot, "assets", "assets", "tray-icon.png");
+// After packaging, `assets/` is copied to <install>/resources/assets by the
+// electron-builder extraResources rule, so it must be read from there. When
+// running from source it stays next to the project. Preloads are unaffected:
+// they are packed into app.asar and still resolve through projectRoot.
+const assetsRoot = app.isPackaged ? join(process.resourcesPath, "assets") : join(projectRoot, "assets");
+const spritesheetPath = join(assetsRoot, "assets", "default-pet-spritesheet.webp");
+const trayIconPath = join(assetsRoot, "assets", "tray-icon.png");
 function oneShotRevertMs(spriteState) {
     if (isLoopingSpriteState(spriteState, stateRows))
         return null;
     const row = stateRows[spriteState];
     return row.durationMs * (("iterations" in row && typeof row.iterations === "number") ? row.iterations : 1);
 }
-function applyReaction(reaction, message) {
+function applyReaction(pet, reaction, message) {
+    if (pet === undefined || pet.window.isDestroyed())
+        return;
     const spriteState = resolveReactionSpriteState(reaction);
-    lastSpriteState = spriteState;
+    pet.lastSpriteState = spriteState;
     const settledMessage = message ?? (reaction ? pickReactionMessage(reaction) : undefined);
-    mainWindow?.webContents.send("openpets:pet-state", { state: spriteState, reaction, message: settledMessage });
-    if (revertTimer) {
-        clearTimeout(revertTimer);
-        revertTimer = null;
+    pet.window.webContents.send("openpets:pet-state", { state: spriteState, reaction, message: settledMessage });
+    if (pet.revertTimer) {
+        clearTimeout(pet.revertTimer);
+        pet.revertTimer = null;
     }
     const revert = oneShotRevertMs(spriteState);
     if (revert !== null) {
-        revertTimer = setTimeout(() => {
-            lastSpriteState = "idle";
-            mainWindow?.webContents.send("openpets:pet-state", { state: "idle" });
+        pet.revertTimer = setTimeout(() => {
+            pet.lastSpriteState = "idle";
+            if (!pet.window.isDestroyed())
+                pet.window.webContents.send("openpets:pet-state", { state: "idle" });
         }, revert + 200);
-        revertTimer.unref?.();
+        pet.revertTimer.unref?.();
     }
 }
 function advanceSchedule() {
     const reaction = reactionSchedule[scheduleIndex % reactionSchedule.length];
     scheduleIndex += 1;
-    applyReaction(reaction);
+    applyReaction(focusedPet(), reaction);
 }
 /** Welcome message: pet waves, says hello, and shows the "Hi" badge (original startup greeting). */
-function sayWelcome() {
-    applyReaction("waving", pickReactionMessage("waving"));
+function sayWelcome(pet) {
+    applyReaction(pet, "waving", pickReactionMessage("waving"));
     // Welcome waving is a looping pose; without the poll loop we must revert to idle ourselves.
-    if (idleRevertTimer)
-        clearTimeout(idleRevertTimer);
-    idleRevertTimer = setTimeout(() => {
-        if (lastSpriteState === resolveReactionSpriteState("waving")) {
-            lastSpriteState = "idle";
-            mainWindow?.webContents.send("openpets:pet-state", { state: "idle" });
+    if (pet.idleRevertTimer)
+        clearTimeout(pet.idleRevertTimer);
+    pet.idleRevertTimer = setTimeout(() => {
+        if (pet.lastSpriteState === resolveReactionSpriteState("waving")) {
+            pet.lastSpriteState = "idle";
+            if (!pet.window.isDestroyed())
+                pet.window.webContents.send("openpets:pet-state", { state: "idle" });
         }
     }, 4200);
-    idleRevertTimer.unref?.();
+    pet.idleRevertTimer.unref?.();
 }
 function clampPointToWorkArea(point, size) {
     const area = screen.getPrimaryDisplay().workArea;
@@ -98,20 +133,38 @@ function clampPointToWorkArea(point, size) {
         y: Math.min(Math.max(point.y, area.y + 2), area.y + area.height - size.height - 2),
     };
 }
-/** Anchor-preserving bounds: the pet stays at its spot while the window grows upward/sideways. */
+/**
+ * Anchor-preserving bounds: the pet stays at its spot while the window grows
+ * upward/sideways. The pet is centred horizontally and sits at the bottom, so
+ * the window origin moves by half the width delta and the full height delta.
+ * When the work area forces a clamp, the resulting pet offset is reported back
+ * so the caller can compensate instead of letting the pet drift.
+ */
 function expandedBoundsFor(collapsed) {
-    const raw = {
-        x: collapsed.x - Math.round((expandedWindowSize.width - collapsedWindowSize.width) / 2),
-        y: collapsed.y - (expandedWindowSize.height - collapsedWindowSize.height),
+    const size = computeExpandedWindowSize();
+    // The pet sits at the window's bottom-right corner, so that corner must not
+    // move: keep the right and bottom edges fixed and grow left/up instead.
+    const desired = {
+        x: collapsed.x + collapsedWindowSize.width - size.width,
+        y: collapsed.y + collapsedWindowSize.height - size.height,
     };
+    const clamped = clampPointToWorkArea(desired, size);
     return {
-        ...clampPointToWorkArea(raw, expandedWindowSize),
-        width: expandedWindowSize.width,
-        height: expandedWindowSize.height,
+        ...clamped,
+        width: size.width,
+        height: size.height,
+        petOffset: { x: clamped.x - desired.x, y: clamped.y - desired.y },
     };
 }
-function publishPanelState() {
-    mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+function publishPanelState(pet) {
+    if (pet === undefined || pet.window.isDestroyed())
+        return;
+    // Include the bound session title so switching/creating a session refreshes
+    // the panel header without a separate history round-trip.
+    pet.window.webContents.send("openpets:pet-panel-state", {
+        chatExpanded: pet.chatExpanded,
+        sessionTitle: pet.sessionTitle ?? "",
+    });
 }
 /** Human-readable pet label for a session, e.g. "my-project". */
 function sessionLabel(directory) {
@@ -119,39 +172,72 @@ function sessionLabel(directory) {
     return name.length > 0 ? name : directory;
 }
 /** Push a plain message to the pet bubble without changing its pose. */
-function say(text) {
-    mainWindow?.webContents.send("openpets:pet-state", { state: lastSpriteState, message: text });
+function say(pet, text) {
+    if (pet === undefined || pet.window.isDestroyed())
+        return;
+    pet.window.webContents.send("openpets:pet-state", { state: pet.lastSpriteState, message: text });
 }
 /**
  * Map OpenCode session events onto pet reactions. Only the session this pet
  * owns is animated, so a busy TUI session elsewhere stays invisible here.
  */
-function handleWatchStatus(update) {
-    if (activeSessionID === undefined || update.sessionID !== activeSessionID)
+/** Find the pet that owns a session id (each session has at most one pet). */
+function petForSession(sessionID) {
+    for (const pet of pets.values()) {
+        if (pet.sessionID === sessionID)
+            return pet;
+    }
+    return undefined;
+}
+const pendingForms = new Map();
+const turnWaiters = new Map();
+/** Resolve (and drop) every waiter parked on a session's terminal event. */
+function resolveTurnWaiters(sessionID, kind) {
+    const waiters = turnWaiters.get(sessionID);
+    if (waiters === undefined)
         return;
-    const label = activeSessionTitle ?? "session";
+    turnWaiters.delete(sessionID);
+    for (const waiter of waiters)
+        waiter(kind);
+}
+function handleWatchStatus(update) {
+    // Terminal states end waiting turns even when the pet is gone; reactions
+    // below only matter for bound pets.
+    if (update.kind === "succeeded" || update.kind === "failed" || update.kind === "interrupted") {
+        resolveTurnWaiters(update.sessionID, update.kind);
+    }
+    const pet = petForSession(update.sessionID);
+    if (pet === undefined)
+        return;
+    const label = pet.sessionTitle ?? "session";
     switch (update.kind) {
         case "enqueued":
-            applyReaction("waving", `${label}: 收到你的消息`);
+            applyReaction(pet, "waving", `${label}: 收到你的消息`);
             return;
         case "started":
-            applyReaction(update.tool === undefined ? "working" : "running", update.tool === undefined ? undefined : `${label}: ${update.tool}`);
+            applyReaction(pet, update.tool === undefined ? "working" : "running", update.tool === undefined ? undefined : `${label}: ${update.tool}`);
             return;
         case "succeeded":
-            applyReaction("success", `${label}: 完成`);
+            applyReaction(pet, "success", `${label}: 完成`);
             return;
         case "failed":
-            applyReaction("error", `${label}: 失败`);
+            applyReaction(pet, "error", `${label}: 失败`);
             return;
         case "interrupted":
-            applyReaction("idle", `${label}: 已中断`);
+            // A stopped turn leaves any pending question dead; the user never
+            // answers a form whose agent loop is gone.
+            for (const [formID, form] of pendingForms) {
+                if (form.sessionID === update.sessionID)
+                    pendingForms.delete(formID);
+            }
+            applyReaction(pet, "idle", `${label}: 已中断`);
             return;
         case "waiting":
-            applyReaction("waiting", update.tool === undefined ? `${label}: 需要你批准` : `${label}: 等你批准 ${update.tool}`);
+            applyReaction(pet, "waiting", update.tool === undefined ? `${label}: 需要你批准` : `${label}: 等你批准 ${update.tool}`);
             return;
     }
 }
-/** Start the SSE watcher once; it reconnects on its own afterwards. */
+/** Start the shared SSE watcher once; it reconnects on its own afterwards. */
 function startWatch() {
     if (watch !== undefined)
         return;
@@ -160,43 +246,63 @@ function startWatch() {
         onEvent: (event) => {
             // The step/text events are high-frequency; only surface the ones that
             // give the pet something meaningful to say, and only for its session.
-            if (activeSessionID === undefined || event.sessionID !== activeSessionID)
+            const sessionID = event.sessionID;
+            if (event.type === "form.created") {
+                // The agent parked on a question form. Route it to the pet bound to
+                // that session; the panel renders the fields and replies through the
+                // form endpoint, which is how the OpenCode web dock answers too.
+                const ask = parseFormCreated(event.payload);
+                if (ask === undefined)
+                    return;
+                const pet = petForSession(ask.sessionID);
+                if (pet === undefined || pet.endpoint === undefined || pet.window.isDestroyed())
+                    return;
+                pendingForms.set(ask.formID, {
+                    sessionID: ask.sessionID,
+                    endpoint: pet.endpoint,
+                    fieldKeys: ask.fieldKeys,
+                });
+                const { sessionID: _ignored, ...card } = ask;
+                pet.window.webContents.send("openpets:pet-ask", card);
+                applyReaction(pet, "waiting", `${pet.sessionTitle ?? "session"}: 需要你确认`);
+                return;
+            }
+            if (sessionID === undefined)
+                return;
+            const pet = petForSession(sessionID);
+            if (pet === undefined)
                 return;
             if (event.type === "session.step.started")
-                applyReaction("thinking", "想了想下一步");
+                applyReaction(pet, "thinking", "想了想下一步");
             if (event.type === "session.step.ended")
-                applyReaction("working", "推进了一步");
+                applyReaction(pet, "working", "推进了一步");
         },
         onConnected: () => console.log("[opencode] SSE connected"),
         onDisconnected: (reason) => {
             console.log(`[opencode] SSE disconnected: ${reason}`);
-            if (activeSessionID !== undefined)
-                say("OpenCode 连接断开，正在重连…");
+            for (const pet of pets.values())
+                say(pet, "OpenCode 连接断开，正在重连…");
         },
     });
     watch.start();
 }
 /**
- * Attach the pet to an OpenCode session for `directory`: reuse the current one
- * when it already points at the same folder, otherwise create a fresh session.
+ * Give this pet its own brand-new session for `directory`. Every pet owns
+ * exactly one session, so this never reuses an existing one.
  */
-async function attachSession(directory) {
+async function attachSession(pet, directory) {
     const discovered = await discoverService();
     if (discovered === undefined)
         return { ok: false, message: "没找到正在运行的 OpenCode 服务（service.json 缺失）" };
-    endpoint = discovered;
+    pet.endpoint = discovered;
+    pet.directory = directory;
     startWatch();
-    if (activeSessionID !== undefined) {
-        const state = watch?.get(activeSessionID);
-        if (state?.directory === directory)
-            return { ok: true, message: `沿用会话：${activeSessionTitle ?? ""}` };
-    }
     try {
         const session = await createSession(discovered, directory, sessionLabel(directory));
-        activeSessionID = session.id;
-        activeSessionTitle = session.title ?? sessionLabel(directory);
-        watch?.track({ id: session.id, title: activeSessionTitle, directory });
-        return { ok: true, message: `已创建会话：${activeSessionTitle}` };
+        pet.sessionID = session.id;
+        pet.sessionTitle = session.title ?? sessionLabel(directory);
+        watch?.track({ id: session.id, title: pet.sessionTitle, directory });
+        return { ok: true, message: `已创建会话：${pet.sessionTitle}` };
     }
     catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
@@ -214,6 +320,78 @@ async function requestInterrupt(target, sessionID) {
     });
     if (!response.ok)
         throw new Error(`停止失败：HTTP ${response.status}`);
+}
+/** One idle-to-idle agent loop, bounded so a hung turn cannot park the panel forever. */
+const HTTP_TURN_TIMEOUT_MS = 600_000;
+/**
+ * Run one turn over the direct HTTP path: `POST /prompt {text}` starts the
+ * loop, and completion arrives as SSE `session.execution.*` for this session
+ * (timeline polling is only the fallback for a missed event). The prompt body
+ * never carries a model — the session's own model is the single source of
+ * truth, so the pet cannot implicitly override model selection.
+ */
+async function runHttpTurn(endpoint, sessionID, text) {
+    // Small slack: the server timestamps the user message, so a turn "starts" a
+    // moment before the POST resolves.
+    const startedAt = Date.now() - 2_000;
+    try {
+        await sendPrompt(endpoint, sessionID, text);
+    }
+    catch (error) {
+        return { kind: "send-failed", error: error instanceof Error ? error.message : String(error) };
+    }
+    console.log(`[opencode-http] prompt sent session=${sessionID}`);
+    return {
+        kind: "done",
+        result: await new Promise((resolve) => {
+            let settled = false;
+            const waiters = turnWaiters.get(sessionID) ?? new Set();
+            turnWaiters.set(sessionID, waiters);
+            const finish = (result) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearInterval(poll);
+                clearTimeout(watchdog);
+                waiters.delete(waiter);
+                if (waiters.size === 0)
+                    turnWaiters.delete(sessionID);
+                resolve(result);
+            };
+            const waiter = (kind) => {
+                void (async () => {
+                    // Terminal event received: give the asynchronous message projection a
+                    // moment, then read the transcript for the finished answer.
+                    for (let attempt = 0; attempt < 8; attempt += 1) {
+                        const result = await turnResultAfter(endpoint, sessionID, startedAt).catch(() => undefined);
+                        if (result !== undefined) {
+                            finish(result);
+                            return;
+                        }
+                        // An interrupted turn never completes its message; report the stop
+                        // instead of waiting out the retries.
+                        if (kind === "interrupted") {
+                            finish({ ok: false, error: "已停止思考" });
+                            return;
+                        }
+                        await new Promise((done) => setTimeout(done, 400));
+                    }
+                    finish({ ok: false, error: "回合已结束，但没有可显示的回复" });
+                })();
+            };
+            waiters.add(waiter);
+            // Fallback for a missed SSE event: poll the projected transcript.
+            const poll = setInterval(() => {
+                void turnResultAfter(endpoint, sessionID, startedAt)
+                    .then((result) => { if (result !== undefined)
+                    finish(result); })
+                    .catch(() => undefined);
+            }, 2_500);
+            poll.unref?.();
+            const watchdog = setTimeout(() => finish({ ok: false, error: "回复超时（10 分钟）" }), HTTP_TURN_TIMEOUT_MS);
+            watchdog.unref?.();
+        }),
+    };
 }
 /**
  * Wait for the agent to answer a prompt we just sent, then return the newest
@@ -262,51 +440,58 @@ async function followReply(target, sessionID, promptText, timeoutMs = 30_000) {
  * panel works even when the pet was not summoned from Explorer. Silent on
  * failure: the user only learns about it when they try to send a message.
  */
-async function connectDefault() {
-    const result = await attachSession(desktopDirectory());
-    if (result.ok && activeSessionTitle !== undefined)
-        say(`${activeSessionTitle} · 已连接`);
+async function connectDefault(pet) {
+    const result = await attachSession(pet, desktopDirectory());
+    if (result.ok)
+        say(pet, `${pet.sessionTitle ?? ""} · 已连接`);
     else
         console.log(`[opencode] startup connect failed: ${result.message ?? "unknown"}`);
 }
 /**
- * Execute a pending summon: attach a session for the requested folder, place
- * the pet at the cursor and greet. Safe to call again on second-instance.
+ * Give `pet` a session for `directory`, place it at the requested spot and
+ * greet. Each summon targets one pet window; nothing is shared globally.
  */
-async function runSummon(request) {
-    pendingSummon = undefined;
-    const win = mainWindow;
-    if (win !== null && !win.isDestroyed()) {
-        const area = screen.getDisplayNearestPoint({ x: request.x ?? 0, y: request.y ?? 0 }).workArea;
-        const placed = placeAtCursor(request, area, collapsedWindowSize);
+async function runSummon(pet, request) {
+    const win = pet.window;
+    if (!win.isDestroyed()) {
+        // The Explorer verb cannot report the click point, so a missing position
+        // falls back to the live cursor location.
+        const cursor = screen.getCursorScreenPoint();
+        const target = { ...request, x: request.x ?? cursor.x, y: request.y ?? cursor.y };
+        const area = screen.getDisplayNearestPoint({ x: target.x, y: target.y }).workArea;
+        const placed = placeAtCursor(target, area, collapsedWindowSize);
         win.setPosition(placed.x, placed.y);
         if (!win.isVisible())
             win.show();
         win.focus();
     }
-    sayWelcome();
-    const result = await attachSession(request.directory);
-    say(result.ok ? `${sessionLabel(request.directory)} · ${result.message ?? ""}` : `召唤失败：${result.message ?? "未知错误"}`);
+    sayWelcome(pet);
+    const result = await attachSession(pet, request.directory);
+    say(pet, result.ok ? `${sessionLabel(request.directory)} · ${result.message ?? ""}` : `召唤失败：${result.message ?? "未知错误"}`);
+    publishPanelState(pet);
 }
-/** Expand/collapse the pet window carrier for the chat panel (anchors the pet in place). */
-function setChatExpanded(next) {
-    console.log(`[pet] setChatExpanded next=${next} current=${chatExpanded}`);
-    if (chatExpanded === next)
+/** Expand/collapse one pet's window carrier for its chat panel (anchors the pet in place). */
+function setChatExpanded(pet, next) {
+    const win = pet.window;
+    console.log(`[pet] setChatExpanded id=${win.webContents.id} next=${next} current=${pet.chatExpanded}`);
+    if (pet.chatExpanded === next)
         return;
-    const win = mainWindow;
-    if (!win || win.isDestroyed())
+    if (win.isDestroyed())
         return;
-    chatExpanded = next;
+    pet.chatExpanded = next;
     const wasResizable = win.isResizable();
     win.setResizable(true);
     try {
         if (next) {
             const collapsed = win.getBounds();
-            collapsedAnchor = { x: collapsed.x, y: collapsed.y };
-            win.setBounds(expandedBoundsFor({ x: collapsed.x, y: collapsed.y }), false);
+            const bounds = expandedBoundsFor({ x: collapsed.x, y: collapsed.y });
+            // Remember where the pet must reappear: its pre-expand origin plus any
+            // clamp shift, so collapsing restores the exact original spot.
+            pet.collapsedAnchor = { x: collapsed.x + bounds.petOffset.x, y: collapsed.y + bounds.petOffset.y };
+            win.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, false);
         }
         else {
-            const anchor = collapsedAnchor ?? (() => {
+            const anchor = pet.collapsedAnchor ?? (() => {
                 const bounds = win.getBounds();
                 return clampPointToWorkArea({ x: bounds.x, y: bounds.y + (collapsedWindowSize.height - bounds.height) }, collapsedWindowSize);
             })();
@@ -317,27 +502,63 @@ function setChatExpanded(next) {
         win.setResizable(wasResizable);
     }
     console.log(`[pet] chat bounds now ${JSON.stringify(win.getBounds())}`);
-    publishPanelState();
+    publishPanelState(pet);
 }
 // The 5s reaction polling loop (表情轮询) was removed per product request:
 // the pet only plays reactions on explicit events (welcome on load, tray
 // 「切换下一个表情」, future OpenCode session events).
-let idleRevertTimer = null;
-async function writePetPage() {
+/**
+ * Render the page for one specific pet. Each instance gets its own file so
+ * several pets with different spritesheets can load at the same time without
+ * overwriting each other.
+ */
+async function writePetPage(petEntry, instanceKey) {
     const dir = join(app.getPath("userData"), "rendered-pets");
     await mkdir(dir, { recursive: true });
-    const filePath = join(dir, "standalone-pet.html");
-    const spriteUrl = currentPetEntry.builtIn
+    const filePath = join(dir, `standalone-pet-${instanceKey}.html`);
+    const spriteUrl = petEntry.builtIn
         ? pathToFileURL(spritesheetPath).toString()
-        : pathToFileURL(currentPetEntry.spritesheetPath).toString();
+        : pathToFileURL(petEntry.spritesheetPath).toString();
     const html = createPetPageHtml({
         scale,
         spritesheetUrl: spriteUrl,
-        atlasRows: currentPetEntry.spriteVersionNumber === 2 ? 11 : 9,
-        petName: currentPetEntry.displayName,
+        atlasRows: petEntry.spriteVersionNumber === 2 ? 11 : 9,
+        petName: petEntry.displayName,
     });
-    await writeFile(filePath, html, "utf8");
+    // Write to a temp file first, then rename: a partial write can never leave a
+    // zero-byte page behind, which previously broke the pet window on startup.
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmpPath, html, "utf8");
+    await rename(tmpPath, filePath);
     return filePath;
+}
+/**
+ * Pick the next appearance in rotation: the user's default pet first, then
+ * every installed pet in turn. Pets already on screen are skipped, so a new
+ * window never duplicates an existing look while another option exists.
+ */
+async function pickPetEntryForNewWindow() {
+    const installed = await listInstalledPets(app.getPath("userData")).catch(() => []);
+    const choices = [
+        currentPetEntry,
+        ...installed.filter((entry) => entry.id !== currentPetEntry.id),
+    ];
+    const inUse = new Set();
+    for (const pet of pets.values())
+        inUse.add(pet.petEntry.id);
+    const start = nextPetEntryIndex % choices.length;
+    for (let offset = 0; offset < choices.length; offset += 1) {
+        const candidate = choices[(start + offset) % choices.length];
+        if (candidate === undefined)
+            continue;
+        if (inUse.has(candidate.id) && inUse.size < choices.length)
+            continue;
+        nextPetEntryIndex = (start + offset + 1) % choices.length;
+        return candidate;
+    }
+    const fallback = choices[start] ?? currentPetEntry;
+    nextPetEntryIndex = (start + 1) % choices.length;
+    return fallback;
 }
 function bottomRightPosition(width, height) {
     const display = screen.getPrimaryDisplay().workArea;
@@ -347,16 +568,16 @@ function bottomRightPosition(width, height) {
     };
 }
 /**
- * Show the pet's own right-click menu. Items are built lazily so model and
+ * Show one pet's own right-click menu. Items are built lazily so model and
  * session lists always reflect the live server state.
  */
-async function showPetContextMenu() {
-    const win = mainWindow;
-    if (win === null || win.isDestroyed())
+async function showPetContextMenu(pet) {
+    const win = pet.window;
+    if (win.isDestroyed())
         return;
-    const target = endpoint ?? (await discoverService());
+    const target = pet.endpoint ?? (await discoverService());
     if (target !== undefined)
-        endpoint = target;
+        pet.endpoint = target;
     const modelItems = [];
     const sessionItems = [];
     if (target === undefined) {
@@ -372,7 +593,7 @@ async function showPetContextMenu() {
             modelItems.push({ label: "没有可用模型", enabled: false });
         }
         else {
-            const current = await getSession(target, activeSessionID ?? "").catch(() => undefined);
+            const current = await getSession(target, pet.sessionID ?? "").catch(() => undefined);
             const currentModel = current?.model;
             for (const model of models) {
                 const checked = currentModel !== undefined && currentModel.providerID === model.providerID && currentModel.id === model.id;
@@ -382,31 +603,31 @@ async function showPetContextMenu() {
                     checked,
                     click: () => {
                         void (async () => {
-                            if (activeSessionID === undefined) {
-                                say("还没有绑定会话");
+                            const sessionID = pet.sessionID;
+                            if (sessionID === undefined) {
+                                say(pet, "还没有绑定会话");
                                 return;
                             }
                             try {
-                                console.log(`[model] switch session=${activeSessionID} -> ${model.providerID}/${model.id}`);
-                                await setSessionModel(target, activeSessionID, { providerID: model.providerID, id: model.id });
+                                console.log(`[model] switch session=${sessionID} -> ${model.providerID}/${model.id}`);
+                                await setSessionModel(target, sessionID, { providerID: model.providerID, id: model.id });
                                 // Do not read the session back here: `ModelSelected` is projected
                                 // asynchronously, so a 204 is followed by a short window where the
                                 // row still holds the previous model. The switch itself is the
                                 // confirmation; the panel refreshes from the server on next open.
-                                console.log(`[model] switched session=${activeSessionID}`);
+                                console.log(`[model] switched session=${sessionID}`);
                                 // Confirm the switch took effect before the panel re-reads it.
                                 // The projection lands asynchronously; this waits for it.
-                                const confirmed = await getSessionAfterModelSwitch(target, activeSessionID, {
+                                const confirmed = await getSessionAfterModelSwitch(target, sessionID, {
                                     providerID: model.providerID,
                                     id: model.id,
                                 }).catch(() => undefined);
-                                console.log(`[model] confirmed=${confirmed?.model ? confirmed.model.providerID + "/" + confirmed.model.id : "null"} session=${activeSessionID}`);
-                                say(`模型已切换：${model.name}`);
-                                if (chatExpanded)
-                                    mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+                                console.log(`[model] confirmed=${confirmed?.model ? confirmed.model.providerID + "/" + confirmed.model.id : "null"} session=${sessionID}`);
+                                say(pet, `模型已切换：${model.name}`);
+                                publishPanelState(pet);
                             }
                             catch (error) {
-                                say(`切换模型失败：${error instanceof Error ? error.message : String(error)}`);
+                                say(pet, `切换模型失败：${error instanceof Error ? error.message : String(error)}`);
                             }
                         })();
                     },
@@ -426,14 +647,14 @@ async function showPetContextMenu() {
                 sessionItems.push({
                     label: `${session.title ?? session.id} — ${basename(directory) || "?"}`,
                     type: "radio",
-                    checked: session.id === activeSessionID,
+                    checked: session.id === pet.sessionID,
                     click: () => {
-                        activeSessionID = session.id;
-                        activeSessionTitle = session.title ?? sessionLabel(directory);
-                        watch?.track({ id: session.id, title: activeSessionTitle, directory });
-                        say(`已切换会话：${activeSessionTitle}`);
-                        if (chatExpanded)
-                            mainWindow?.webContents.send("openpets:pet-panel-state", { chatExpanded });
+                        pet.sessionID = session.id;
+                        pet.sessionTitle = session.title ?? sessionLabel(directory);
+                        pet.directory = directory;
+                        watch?.track({ id: session.id, title: pet.sessionTitle, directory });
+                        say(pet, `已切换会话：${pet.sessionTitle}`);
+                        publishPanelState(pet);
                     },
                 });
             }
@@ -444,26 +665,9 @@ async function showPetContextMenu() {
         {
             label: "新建 session",
             click: () => {
-                void (async () => {
-                    const directory = watch?.get(activeSessionID ?? "")?.directory ?? desktopDirectory();
-                    try {
-                        const discovered = await discoverService();
-                        if (discovered === undefined) {
-                            say("OpenCode 未连接");
-                            return;
-                        }
-                        endpoint = discovered;
-                        startWatch();
-                        const session = await createSession(discovered, directory, sessionLabel(directory));
-                        activeSessionID = session.id;
-                        activeSessionTitle = session.title ?? sessionLabel(directory);
-                        watch?.track({ id: session.id, title: activeSessionTitle, directory });
-                        say(`已新建会话：${activeSessionTitle}`);
-                    }
-                    catch (error) {
-                        say(`新建会话失败：${error instanceof Error ? error.message : String(error)}`);
-                    }
-                })();
+                // A new session gets its own new pet window (one pet per session) and
+                // the next appearance in rotation, so it does not look identical.
+                void dispatchSummon({ directory: pet.directory ?? desktopDirectory() });
             },
         },
         { label: "选择 session", submenu: sessionItems },
@@ -472,18 +676,19 @@ async function showPetContextMenu() {
     ]);
     menu.popup({ window: win });
 }
-function createPetWindow() {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-        void writePetPage().then((filePath) => mainWindow?.loadFile(filePath));
-        return;
-    }
+/**
+ * Create one new pet window and register its instance. Every call makes a new
+ * window, so a new session always gets its own pet.
+ */
+function createPetWindow(options = {}) {
     const width = 320;
     const height = 300;
+    const petEntry = options.petEntry ?? currentPetEntry;
     const window = new BrowserWindow({
         title: "OpenPets pet",
         width,
         height,
-        ...bottomRightPosition(width, height),
+        ...(options.position ?? bottomRightPosition(width, height)),
         frame: false,
         transparent: true,
         resizable: false,
@@ -505,15 +710,33 @@ function createPetWindow() {
     });
     window.setAlwaysOnTop(true, "floating");
     window.setMenu(null);
+    const pet = {
+        window,
+        petEntry,
+        endpoint: undefined,
+        sessionID: undefined,
+        sessionTitle: undefined,
+        directory: options.directory ?? desktopDirectory(),
+        lastSpriteState: "idle",
+        revertTimer: null,
+        idleRevertTimer: null,
+        chatExpanded: false,
+        collapsedAnchor: null,
+    };
+    pets.set(window.webContents.id, pet);
+    focusedPetId = window.webContents.id;
     // Hide the chat panel when the pet window loses focus. `setChatExpanded`
     // returns early when already collapsed, so this is a no-op most of the time.
     window.on("blur", () => {
-        if (chatExpanded)
-            setChatExpanded(false);
+        if (pet.chatExpanded)
+            setChatExpanded(pet, false);
+    });
+    window.on("focus", () => {
+        focusedPetId = window.webContents.id;
     });
     // Pet's own right-click menu: model / new session / switch session / hide.
     window.webContents.on("context-menu", () => {
-        void showPetContextMenu();
+        void showPetContextMenu(pet);
     });
     // Forward renderer console output to the main process stdout so the chat
     // panel interactions can be diagnosed from the terminal.
@@ -523,24 +746,31 @@ function createPetWindow() {
     // Re-show the welcome greeting whenever the pet page loads (startup and
     // every later reload, e.g. switching the default pet).
     window.webContents.on("did-finish-load", () => {
-        sayWelcome();
-        publishPanelState();
+        sayWelcome(pet);
+        publishPanelState(pet);
     });
-    void writePetPage().then((filePath) => window.loadFile(filePath)).then(() => {
+    void writePetPage(petEntry, window.webContents.id).then((filePath) => window.loadFile(filePath)).then(() => {
         window.show();
     }).catch((error) => {
         console.error("pet page load failed", error);
     });
-    mainWindow = window;
     window.on("closed", () => {
-        mainWindow = null;
+        if (pet.revertTimer)
+            clearTimeout(pet.revertTimer);
+        if (pet.idleRevertTimer)
+            clearTimeout(pet.idleRevertTimer);
+        pets.delete(window.webContents.id);
+        if (focusedPetId === window.webContents.id)
+            focusedPetId = undefined;
     });
-    const queued = pendingSummon;
+    const queued = pendingSummons.get(window.webContents.id);
     if (queued !== undefined) {
+        pendingSummons.delete(window.webContents.id);
         window.webContents.once("did-finish-load", () => {
-            void runSummon(queued);
+            void runSummon(pet, queued);
         });
     }
+    return pet;
 }
 function createTray() {
     const icon = nativeImage.createFromPath(trayIconPath);
@@ -563,20 +793,23 @@ function createTray() {
             type: "normal",
             click: () => {
                 void (async () => {
-                    console.log(`[diag] tray send start endpoint=${String(endpoint)} session=${String(activeSessionID)}`);
-                    if (endpoint === undefined || activeSessionID === undefined) {
+                    const pet = focusedPet();
+                    const target = pet?.endpoint;
+                    const sessionID = pet?.sessionID;
+                    console.log(`[diag] tray send start endpoint=${String(target)} session=${String(sessionID)}`);
+                    if (target === undefined || sessionID === undefined) {
                         console.log("[diag] tray send aborted: not connected");
                         return;
                     }
                     try {
-                        await sendPrompt(endpoint, activeSessionID, "123");
+                        await sendPrompt(target, sessionID, "123");
                         console.log("[diag] tray sendPrompt ok");
                     }
                     catch (error) {
                         console.log(`[diag] tray sendPrompt failed: ${error instanceof Error ? error.message : String(error)}`);
                         return;
                     }
-                    const reply = await followReply(endpoint, activeSessionID, "123").catch((error) => ({ ok: false, error: String(error) }));
+                    const reply = await followReply(target, sessionID, "123").catch((error) => ({ ok: false, error: String(error) }));
                     console.log(`[diag] tray reply ${JSON.stringify(reply).slice(0, 400)}`);
                 })();
             },
@@ -656,70 +889,148 @@ function installIpc() {
     ipcMain.on("openpets:pet-message", (event, message) => {
         if (typeof message !== "string" || message.length === 0)
             return;
-        event.sender.send("openpets:pet-state", { state: lastSpriteState, message });
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return;
+        event.sender.send("openpets:pet-state", { state: pet.lastSpriteState, message });
     });
-    ipcMain.on("openpets:pet-chat-toggle", () => {
-        setChatExpanded(!chatExpanded);
+    ipcMain.on("openpets:pet-chat-toggle", (event) => {
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return;
+        setChatExpanded(pet, !pet.chatExpanded);
     });
     // Full projected transcript for the bound session, oldest first. The panel
     // calls this on open so the first paint shows real OpenCode history.
-    ipcMain.handle("openpets:pet-chat-history", async () => {
-        if (endpoint === undefined)
-            return { ok: false, error: "OpenCode 未连接", messages: [] };
-        if (activeSessionID === undefined)
-            return { ok: false, error: "当前宠物还没有绑定会话", messages: [] };
-        const messages = await readTimeline(endpoint, activeSessionID).catch(() => undefined);
+    ipcMain.handle("openpets:pet-chat-history", async (event) => {
+        // Always report the bound session's title so the panel header can show it
+        // even when there is no history yet (a brand-new session).
+        const pet = petForSender(event.sender);
+        const sessionTitle = pet?.sessionTitle ?? "";
+        if (pet === undefined)
+            return { ok: false, error: "宠物已关闭", sessionTitle, messages: [] };
+        if (pet.endpoint === undefined)
+            return { ok: false, error: "OpenCode 未连接", sessionTitle, messages: [] };
+        if (pet.sessionID === undefined)
+            return { ok: false, error: "当前宠物还没有绑定会话", sessionTitle, messages: [] };
+        const messages = await readTimeline(pet.endpoint, pet.sessionID).catch(() => undefined);
         if (messages === undefined)
-            return { ok: false, error: "读取会话历史失败", messages: [] };
-        return { ok: true, sessionTitle: activeSessionTitle ?? "", messages };
+            return { ok: false, error: "读取会话历史失败", sessionTitle, messages: [] };
+        return { ok: true, sessionTitle, messages };
     });
     // The chat panel shows the model the bound session actually runs on, so the
     // user can tell whether a switch took effect without opening OpenCode.
-    ipcMain.handle("openpets:pet-chat-model", async () => {
-        if (endpoint === undefined)
+    ipcMain.handle("openpets:pet-chat-model", async (event) => {
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return { ok: false, label: "宠物已关闭" };
+        if (pet.endpoint === undefined)
             return { ok: false, label: "OpenCode 未连接" };
-        if (activeSessionID === undefined)
+        if (pet.sessionID === undefined)
             return { ok: false, label: "未绑定会话" };
-        const session = await getSession(endpoint, activeSessionID).catch(() => undefined);
+        const session = await getSession(pet.endpoint, pet.sessionID).catch(() => undefined);
         const model = session?.model;
         if (model === undefined)
             return { ok: true, label: "默认模型（会话未指定）" };
         return { ok: true, label: `${model.providerID}/${model.id}` };
     });
-    ipcMain.handle("openpets:pet-chat-send", async (_event, raw) => {
+    ipcMain.handle("openpets:pet-chat-send", async (event, raw) => {
         const text = typeof raw === "string" ? raw.trim() : "";
         if (!text)
             return { ok: false, error: "消息为空" };
         if (text.length > 4000)
             return { ok: false, error: "消息太长（上限 4000 字）" };
-        if (activeSessionID === undefined)
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return { ok: false, error: "宠物已关闭" };
+        const sessionID = pet.sessionID;
+        if (sessionID === undefined)
             return { ok: false, error: "当前宠物还没有绑定会话，请稍候或重新召唤" };
-        // Run the turn through the real CLI, exactly like the user does in a
-        // terminal. The v2 HTTP `prompt` endpoint only steers a running agent, so
-        // it never starts a turn on an idle session.
-        const directory = watch?.get(activeSessionID)?.directory;
-        // Mirror OpenCode's own session model into the CLI invocation; the session
-        // is the source of truth, so a model the user picked in OpenCode (or in
-        // the pet's context menu) is the one this turn runs on.
-        const session = endpoint === undefined ? undefined : await getSession(endpoint, activeSessionID).catch(() => undefined);
+        // Plan A: run the turn straight over the HTTP API the OpenCode web app uses.
+        // The prompt never carries a model — the session's own model decides every
+        // turn, so the pet cannot implicitly override model selection — and a
+        // `question` form keeps the loop genuinely parked until the panel replies.
+        if (pet.endpoint !== undefined) {
+            const http = await runHttpTurn(pet.endpoint, sessionID, text);
+            if (http.kind === "done")
+                return http.result;
+            console.log(`[opencode-http] send failed, falling back to CLI: ${http.error}`);
+        }
+        // Fallback: run the turn through the real CLI, exactly like the user does
+        // in a terminal. Prompt delivery failed over HTTP, so mirror the session's
+        // own model into the invocation to keep the turn on it.
+        const directory = watch?.get(sessionID)?.directory ?? pet.directory;
+        // The session is the source of truth, so a model the user picked in
+        // OpenCode (or in the pet's context menu) is the one this turn runs on.
+        const session = pet.endpoint === undefined ? undefined : await getSession(pet.endpoint, sessionID).catch(() => undefined);
         const model = session?.model;
-        return await runPrompt(activeSessionID, text, directory, model === undefined ? undefined : { providerID: model.providerID, id: model.id });
+        // A `question` tool call is the agent asking the user to pick an option. The
+        // CLI never renders it, so forward it to this pet's panel while the turn is
+        // still running; the panel answers by sending the chosen label back as the
+        // next prompt, which is how `opencode run` resumes that turn.
+        return await runPrompt(sessionID, text, directory, model === undefined ? undefined : { providerID: model.providerID, id: model.id }, (ask) => {
+            if (pet.window.isDestroyed())
+                return;
+            pet.window.webContents.send("openpets:pet-ask", ask);
+            // A non-interactive CLI run cancels the question immediately and lets
+            // the model free-wheel through "reasonable assumptions" — the pet must
+            // not look like it is asking and answering itself. Interrupt the
+            // server-side loop the moment the card surfaces; the user's submitted
+            // answer then starts a fresh turn that sees the Q&A in history.
+            if (pet.endpoint !== undefined)
+                void interruptSession(pet.endpoint, sessionID);
+        });
+    });
+    // Answer a question form the agent is parked on (SSE `form.created` route).
+    // One reply covers every question of the form, mirroring the OpenCode web
+    // dock: the loop resumes the instant this resolves, no follow-up prompt.
+    ipcMain.handle("openpets:pet-ask-reply", async (event, payload) => {
+        const record = (typeof payload === "object" && payload !== null ? payload : {});
+        const formID = typeof record.formID === "string" ? record.formID : "";
+        const pending = pendingForms.get(formID);
+        if (pending === undefined)
+            return { ok: false, error: "问题已失效" };
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return { ok: false, error: "宠物已关闭" };
+        if (pet.sessionID !== pending.sessionID)
+            return { ok: false, error: "会话不匹配" };
+        const answers = Array.isArray(record.answers) ? record.answers : [];
+        const answer = {};
+        pending.fieldKeys.forEach((key, index) => {
+            const value = answers[index];
+            if (typeof value === "string" && value.trim().length > 0)
+                answer[key] = value.trim();
+        });
+        try {
+            await replyForm(pending.endpoint, pending.sessionID, formID, answer);
+            pendingForms.delete(formID);
+            console.log(`[opencode-http] form replied session=${pending.sessionID} form=${formID} fields=${Object.keys(answer).length}`);
+            return { ok: true };
+        }
+        catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
     });
     // User-initiated "stop thinking": kill the CLI turn this pet started, and
     // also interrupt the server-side loop in case it already took the prompt.
     // The session stays bound and usable afterwards.
-    ipcMain.handle("openpets:pet-chat-stop", async () => {
+    ipcMain.handle("openpets:pet-chat-stop", async (event) => {
         const killedLocal = abortRunPrompt();
-        if (endpoint !== undefined && activeSessionID !== undefined) {
-            await requestInterrupt(endpoint, activeSessionID).catch(() => undefined);
+        const pet = petForSender(event.sender);
+        if (pet !== undefined && pet.endpoint !== undefined && pet.sessionID !== undefined) {
+            await requestInterrupt(pet.endpoint, pet.sessionID).catch(() => undefined);
         }
         if (!killedLocal)
             return { ok: false, error: "当前没有进行中的回复" };
         return { ok: true };
     });
-    ipcMain.on("openpets:pet-drag-move", (_event, payload) => {
-        const win = mainWindow;
-        if (!win || win.isDestroyed())
+    ipcMain.on("openpets:pet-drag-move", (event, payload) => {
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return;
+        const win = pet.window;
+        if (win.isDestroyed())
             return;
         const dx = typeof payload?.dx === "number" ? Math.round(payload.dx) : 0;
         const dy = typeof payload?.dy === "number" ? Math.round(payload.dy) : 0;
@@ -764,7 +1075,13 @@ function installIpc() {
         }
         await writeManagedState(userData, { defaultPetId: petId });
         currentPetEntry = await resolveDefaultPet(userData);
-        createPetWindow(); // rebuilds in place: same window reloads the new page
+        // Reload every live pet page with the new default sprite.
+        for (const pet of pets.values()) {
+            if (pet.window.isDestroyed())
+                continue;
+            pet.petEntry = currentPetEntry;
+            void writePetPage(currentPetEntry, pet.window.webContents.id).then((filePath) => pet.window.loadFile(filePath));
+        }
         return { ok: true, message: "已设为默认" };
     });
     ipcMain.handle("pets:import-folder", async () => {
@@ -778,17 +1095,17 @@ function installIpc() {
         return importPetFolder(app.getPath("userData"), result.filePaths[0]);
     });
 }
-/** Handle a summon request, waiting for the pet window to exist if needed. */
-function dispatchSummon(request) {
-    if (mainWindow === null || mainWindow.isDestroyed()) {
-        pendingSummon = request;
-        createPetWindow();
-        return;
-    }
-    void runSummon(request);
+/**
+ * Handle a summon request: always spawn a brand-new pet window with its own
+ * session for the requested folder.
+ */
+async function dispatchSummon(request) {
+    const petEntry = await pickPetEntryForNewWindow();
+    const pet = createPetWindow({ directory: request.directory, petEntry });
+    void runSummon(pet, request);
 }
 // Explorer invokes one process per click; a second launch forwards its request
-// to the running instance instead of stacking duplicate pets.
+// to the running instance instead of stacking duplicate processes.
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) {
     app.quit();
@@ -797,8 +1114,9 @@ else {
     app.on("second-instance", (_event, argv) => {
         const request = parseSummonRequest(argv);
         if (request === undefined) {
-            mainWindow?.show();
-            mainWindow?.focus();
+            const pet = focusedPet();
+            pet?.window.show();
+            pet?.window.focus();
             return;
         }
         dispatchSummon(request);
@@ -809,28 +1127,32 @@ void app.whenReady().then(async () => {
     currentPetEntry = await resolveDefaultPet(app.getPath("userData"));
     createTray();
     const startupSummon = parseSummonRequest(process.argv);
-    if (startupSummon !== undefined)
-        pendingSummon = startupSummon;
-    createPetWindow();
-    // Connect on plain launch too: the pet is useful without a context-menu
-    // summon, so bind a session for the default folder right away. A startup
-    // summon already queued its own attach inside runSummon and wins here.
-    if (startupSummon === undefined)
-        void connectDefault();
+    const firstPet = createPetWindow(startupSummon === undefined ? {} : { directory: startupSummon.directory, petEntry: await pickPetEntryForNewWindow() });
+    if (startupSummon !== undefined) {
+        // The window is already created for this request; drive it directly.
+        void runSummon(firstPet, startupSummon);
+    }
+    else {
+        // Connect on plain launch too: the pet is useful without a context-menu
+        // summon, so bind a session for the default folder right away.
+        void connectDefault(firstPet);
+    }
 });
 app.on("window-all-closed", () => {
-    // The pet window is the app; closing it exits like quitting the pet.
+    // Pets are the app; closing the last one exits.
     app.quit();
 });
 app.on("quit", () => {
-    if (revertTimer)
-        clearTimeout(revertTimer);
     watch?.stop();
-    // Quitting the pet ends its session's running work, per product decision.
-    if (endpoint !== undefined && activeSessionID !== undefined) {
-        void interruptSession(endpoint, activeSessionIdOrEmpty());
+    // Quitting ends every pet's session work and clears its timers.
+    for (const pet of pets.values()) {
+        if (pet.revertTimer)
+            clearTimeout(pet.revertTimer);
+        if (pet.idleRevertTimer)
+            clearTimeout(pet.idleRevertTimer);
+        if (pet.endpoint !== undefined && pet.sessionID !== undefined) {
+            void interruptSession(pet.endpoint, pet.sessionID);
+        }
     }
+    pets.clear();
 });
-function activeSessionIdOrEmpty() {
-    return activeSessionID ?? "";
-}

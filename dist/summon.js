@@ -37,6 +37,15 @@ function readNumber(args, flag) {
     const value = Number.parseInt(raw, 10);
     return Number.isFinite(value) ? value : undefined;
 }
+/**
+ * A static Explorer verb cannot read the click position, so pet-launch.cmd
+ * always passes `0 0`. Treat the origin as "no position given" and let the
+ * caller fall back to the real cursor location.
+ */
+function readCursorCoord(args, flag) {
+    const value = readNumber(args, flag);
+    return value === 0 ? undefined : value;
+}
 /** Parse argv (without the electron/exe prefix). Returns undefined when not a summon. */
 export function parseSummonRequest(argv) {
     if (!argv.includes(SUMMON_FLAG))
@@ -44,8 +53,8 @@ export function parseSummonRequest(argv) {
     const dirIndex = argv.indexOf("--dir");
     return {
         directory: resolveDirectory(dirIndex === -1 ? undefined : argv[dirIndex + 1]),
-        x: readNumber(argv, "--x"),
-        y: readNumber(argv, "--y"),
+        x: readCursorCoord(argv, "--x"),
+        y: readCursorCoord(argv, "--y"),
     };
 }
 /** Clamp a cursor point so the pet window stays fully on the target work area. */
