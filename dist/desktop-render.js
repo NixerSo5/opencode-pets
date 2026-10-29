@@ -338,25 +338,40 @@ export function createPetPageHtml(options = {}) {
 
     const shell = document.getElementById("petShell");
 
-    // Pointer logic: a short, still press anywhere in the window toggles the
-    // chat; moving the pointer past a small threshold turns it into a window
-    // drag and suppresses the click (original manual-pet-drag behavior).
+    // Pointer logic: a short, still press on the visible sprite frame toggles
+    // the chat; moving the pointer past a small threshold turns it into a
+    // window drag and suppresses the click (original manual-pet-drag behavior).
     //
-    // The listeners live on the document rather than on the pet shell: the
-    // carrier window reserves a strip above the sprite for the bubble, and
-    // clicks in that transparent strip (or on any transparent pixel of the
-    // sprite) would otherwise never reach the shell, so tapping the pet
-    // appeared dead. Drag is still only armed when the press starts on the
-    // sprite, otherwise a click near the bubble could drag the pet.
+    // The listeners still live on the document so pointer captures survive
+    // even when the sprite slides out from under the cursor, but a press is
+    // only accepted when it starts inside the current sprite frame. The
+    // carrier window is taller than the sprite (it reserves a transparent
+    // strip above the sprite for the bubble), and the sprite frame itself can
+    // have transparent padding, so accepting presses anywhere in the window
+    // made the clickable area follow the window rather than the pet. Checking
+    // the shell's frame rect keeps hit-testing pinned to what the user sees.
     const dragThresholdPx = 6;
     let press = null;
     let suppressClickUntil = 0;
+    function insideSpriteFrame(event) {
+      const rect = shell.getBoundingClientRect();
+      return (
+        event.clientX >= rect.left &&
+        event.clientX <= rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY <= rect.bottom
+      );
+    }
     document.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
       if (Date.now() < suppressClickUntil) return;
       // Clicks on the bubble dismiss it and must not toggle the panel.
       if (badge.contains(event.target)) return;
-      const onSprite = shell.contains(event.target);
+      // Presses outside the sprite frame (the transparent bubble strip above
+      // it, or the transparent margin around it) are ignored entirely so the
+      // pet's clickable area matches its visible footprint.
+      if (!insideSpriteFrame(event)) return;
+      const onSprite = shell.contains(event.target) || insideSpriteFrame(event);
       press = {
         x: event.screenX,
         y: event.screenY,
