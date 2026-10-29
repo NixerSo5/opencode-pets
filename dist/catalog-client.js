@@ -60,6 +60,8 @@ function parseCatalogEntry(raw) {
         original: record.original === true,
         spriteVersionNumber: record.spriteVersionNumber === 2 ? 2 : record.spriteVersionNumber === 1 ? 1 : undefined,
         catalogPage: typeof record.catalogPage === "number" ? record.catalogPage : undefined,
+        wardrobeZip: typeof record.wardrobeZip === "string" ? record.wardrobeZip : undefined,
+        minOpenPetsVersion: typeof record.minOpenPetsVersion === "string" ? record.minOpenPetsVersion : undefined,
     };
 }
 /** One marketplace page (100 pets, unfiltered). Out-of-range pages throw. */

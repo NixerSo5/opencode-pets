@@ -23,4 +23,7 @@ contextBridge.exposeInMainWorld("openpetsDemo", {
   dragMove: (dx, dy) => {
     ipcRenderer.send("openpets:pet-drag-move", { dx, dy });
   },
+  dragEnd: () => {
+    ipcRenderer.send("openpets:pet-drag-end");
+  },
 });

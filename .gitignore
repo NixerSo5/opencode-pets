@@ -8,3 +8,8 @@ release/
 # 本地调试探针
 probe*.txt
 probe*.cmd
+probe*.mjs
+probe*.cjs
+
+# IDE / JetBrains
+.idea/

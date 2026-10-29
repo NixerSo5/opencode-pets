@@ -17,10 +17,12 @@ import { defaultPetSprite, getConfiguredSpriteStates, isLoopingSpriteState, reso
 import { createManagementHtml } from "./management-render.js";
 import { getCatalogPage, getCatalogAllPets } from "./catalog-client.js";
 import { installCatalogPet } from "./catalog-install.js";
-import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, } from "./pet-store.js";
+import { builtInPetEntry, resolveDefaultPet, importPetFolder, listInstalledPets, readManagedState, writeManagedState, updatePetWardrobePreference, wardrobePreferenceFor, } from "./pet-store.js";
+import { resolveWardrobeOutfit, describeAutomaticOutfit, defaultOutfitId, autoOutfitId } from "./pet-wardrobe-core.js";
 import { pickReactionMessage } from "./reaction-messages.js";
 import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, parseFormCreated, readTimeline, toolSummary, replyForm, deleteSession, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, turnResultAfter, } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
+import { ensureOpenCodeService } from "./opencode-ensure.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
 // Collapsed carrier is the scaled sprite footprint plus a small margin, plus a
@@ -169,6 +171,7 @@ function oneShotRevertMs(spriteState) {
 function applyReaction(pet, reaction, message) {
     if (pet === undefined || pet.window.isDestroyed())
         return;
+    cancelWalk(pet);
     const spriteState = resolveReactionSpriteState(reaction);
     pet.lastSpriteState = spriteState;
     const settledMessage = message ?? (reaction ? pickReactionMessage(reaction) : undefined);
@@ -180,12 +183,84 @@ function applyReaction(pet, reaction, message) {
     const revert = oneShotRevertMs(spriteState);
     if (revert !== null) {
         pet.revertTimer = setTimeout(() => {
+            if (pet.window.isDestroyed())
+                return;
             pet.lastSpriteState = "idle";
-            if (!pet.window.isDestroyed())
-                pet.window.webContents.send("openpets:pet-state", { state: "idle" });
+            pet.window.webContents.send("openpets:pet-state", { state: "idle" });
+            scheduleWalk(pet);
         }, revert + 200);
         pet.revertTimer.unref?.();
     }
+}
+/**
+ * Show a directional walk pose without touching the reaction/revert machinery.
+ * Used by drag feedback and the idle walk-about ticker; both are "cosmetic"
+ * states that must not schedule a revert or clobber an agent reaction.
+ */
+function pushWalkState(pet, state) {
+    if (pet.window.isDestroyed())
+        return;
+    pet.lastSpriteState = state;
+    pet.window.webContents.send("openpets:pet-state", { state });
+}
+/** Cancel any pending idle walk; called on drag start and on reactions. */
+function cancelWalk(pet) {
+    if (pet.walkTimer !== null) {
+        clearTimeout(pet.walkTimer);
+        pet.walkTimer = null;
+    }
+}
+/**
+ * Occasionally let an idle pet walk a short distance left or right, playing
+ * the directional rows that the fixed window otherwise never shows. The pet
+ * only walks while truly idle: no reaction, no drag, no panel open.
+ */
+function scheduleWalk(pet) {
+    cancelWalk(pet);
+    const delay = 12_000 + Math.random() * 18_000;
+    pet.walkTimer = setTimeout(() => {
+        pet.walkTimer = null;
+        if (pet.window.isDestroyed())
+            return;
+        if (pet.dragging || pet.chatExpanded) {
+            scheduleWalk(pet);
+            return;
+        }
+        if (pet.lastSpriteState !== "idle") {
+            scheduleWalk(pet);
+            return;
+        }
+        void walkOnce(pet);
+    }, delay);
+    pet.walkTimer.unref?.();
+}
+/** One short walk: pick a direction, glide the window, then return to idle. */
+async function walkOnce(pet) {
+    if (pet.window.isDestroyed())
+        return;
+    const win = pet.window;
+    const right = Math.random() < 0.5;
+    const distance = 24 + Math.round(Math.random() * 40);
+    pushWalkState(pet, right ? "running-right" : "running-left");
+    const start = win.getBounds();
+    const target = clampPointToWorkArea({ x: start.x + (right ? distance : -distance), y: start.y }, { width: start.width, height: start.height });
+    const steps = 12;
+    const stepX = (target.x - start.x) / steps;
+    for (let i = 0; i < steps; i += 1) {
+        if (win.isDestroyed() || pet.dragging)
+            break;
+        if (pet.lastSpriteState !== "running-left" && pet.lastSpriteState !== "running-right")
+            break;
+        const bounds = win.getBounds();
+        win.setPosition(Math.round(bounds.x + stepX), bounds.y);
+        await new Promise((resolve) => setTimeout(resolve, 90));
+    }
+    if (win.isDestroyed())
+        return;
+    if (pet.lastSpriteState === "running-left" || pet.lastSpriteState === "running-right") {
+        pushWalkState(pet, "idle");
+    }
+    scheduleWalk(pet);
 }
 function advanceSchedule() {
     const reaction = reactionSchedule[scheduleIndex % reactionSchedule.length];
@@ -391,6 +466,25 @@ function notifyTurnDone(pet, label) {
     }
     catch (error) {
         console.error("notification failed", error);
+    }
+}
+/**
+ * Tell the user (once per failure) that OpenCode could not be brought up.
+ * The pet cannot work without the service, so failing silently here would
+ * leave a stuck "连接中" bubble with no explanation.
+ */
+function notifyOpenCodeProblem(error) {
+    if (!Notification.isSupported())
+        return;
+    try {
+        new Notification({
+            title: "OpenPets：OpenCode 未就绪",
+            body: error,
+            silent: false,
+        }).show();
+    }
+    catch {
+        // Notifications are best-effort; the console log already carries the error.
     }
 }
 /** Human-readable pet label for a session, e.g. "my-project". */
@@ -616,9 +710,13 @@ function startWatch() {
  * exactly one session, so this never reuses an existing one.
  */
 async function attachSession(pet, directory) {
-    const discovered = await discoverService();
-    if (discovered === undefined)
-        return { ok: false, message: "没找到正在运行的 OpenCode 服务（service.json 缺失）" };
+    // Bring install + service-start into the same memoized promise so a failed
+    // ensure is retried on the next attach instead of caching a failure.
+    const ready = await ensureOpenCodeReady();
+    if (!ready.ok || ready.endpoint === undefined) {
+        return { ok: false, message: ready.error ?? "OpenCode 服务不可用" };
+    }
+    const discovered = ready.endpoint;
     console.log(`[summon-debug] attachSession directory=${directory} endpoint=${discovered.url}`);
     pet.endpoint = discovered;
     pet.directory = directory;
@@ -635,6 +733,31 @@ async function attachSession(pet, directory) {
     catch (error) {
         return { ok: false, message: error instanceof Error ? error.message : String(error) };
     }
+}
+/**
+ * Memoized bring-up of OpenCode (probe → optional install → optional service
+ * start). Cleared on failure so the next attach retries; a running service
+ * is never restarted or stopped.
+ */
+let serviceReadyPromise;
+function ensureOpenCodeReady() {
+    if (serviceReadyPromise === undefined) {
+        serviceReadyPromise = ensureOpenCodeService({
+            userDataPath: app.getPath("userData"),
+            onProgress: (progress) => console.log(`[opencode-ensure] ${progress.stage}: ${progress.message}`),
+        }).then((result) => {
+            if (result.ok) {
+                console.log(`[opencode-ensure] ready url=${result.endpoint?.url} installedHere=${result.installedHere === true} startedHere=${result.startedHere === true}`);
+            }
+            else {
+                console.log(`[opencode-ensure] FAILED: ${result.error}`);
+                serviceReadyPromise = undefined;
+                notifyOpenCodeProblem(result.error ?? "未知错误");
+            }
+            return result;
+        });
+    }
+    return serviceReadyPromise;
 }
 /** Interrupt the session's agent loop; throws when the server rejects it. */
 async function requestInterrupt(target, sessionID) {
@@ -849,17 +972,35 @@ function setChatExpanded(pet, next) {
 // the pet only plays reactions on explicit events (welcome on load, tray
 // 「切换下一个表情」, future OpenCode session events).
 /**
+ * Which atlas should this pet render right now? Reads wardrobe preferences
+ * from state.json and evaluates the schedule against the current moment.
+ * Empty catalog result = render the base atlas.
+ */
+function petRenderPlan(petEntry) {
+    if (petEntry.builtIn || petEntry.wardrobe === undefined)
+        return {};
+    const prefs = wardrobePreferenceFor(readManagedState(app.getPath("userData")), petEntry.id);
+    const outfitId = resolveWardrobeOutfit(petEntry.wardrobe, prefs, new Date());
+    if (outfitId === defaultOutfitId)
+        return {};
+    const outfit = petEntry.wardrobe.outfits.find((candidate) => candidate.id === outfitId);
+    if (outfit === undefined)
+        return {};
+    return { atlasPath: join(dirname(petEntry.spritesheetPath), outfit.spritesheetPath), outfitId: outfit.id };
+}
+/**
  * Render the page for one specific pet. Each instance gets its own file so
  * several pets with different spritesheets can load at the same time without
- * overwriting each other.
+ * overwriting each other. `plan` may override the displayed atlas (wardrobe).
  */
-async function writePetPage(petEntry, instanceKey) {
+async function writePetPage(petEntry, instanceKey, plan = {}) {
     const dir = join(app.getPath("userData"), "rendered-pets");
     await mkdir(dir, { recursive: true });
     const filePath = join(dir, `standalone-pet-${instanceKey}.html`);
+    const spritesheet = plan.atlasPath ?? petEntry.spritesheetPath;
     const spriteUrl = petEntry.builtIn
         ? pathToFileURL(spritesheetPath).toString()
-        : pathToFileURL(petEntry.spritesheetPath).toString();
+        : pathToFileURL(spritesheet).toString();
     const html = createPetPageHtml({
         scale,
         spritesheetUrl: spriteUrl,
@@ -872,6 +1013,14 @@ async function writePetPage(petEntry, instanceKey) {
     await writeFile(tmpPath, html, "utf8");
     await rename(tmpPath, filePath);
     return filePath;
+}
+/** Write + load a pet page for one instance, recording which outfit it shows. */
+async function renderPetPage(pet, petEntry) {
+    const plan = petRenderPlan(petEntry);
+    const filePath = await writePetPage(petEntry, pet.window.webContents.id, plan);
+    pet.wardrobeOutfitId = plan.outfitId;
+    pet.wardrobeAtlasPath = plan.atlasPath;
+    await pet.window.loadFile(filePath);
 }
 /**
  * Pick the next appearance in rotation: the user's default pet first, then
@@ -959,6 +1108,108 @@ async function cleanupEmptySessions(pet) {
     const detail = failed > 0 ? `，失败 ${failed} 个` : "";
     say(pet, `已删除空会话 ${removed} 个${detail}`);
     publishPanelState(pet);
+}
+/** Outfit submenu: auto-follow, base atlas, and one radio per outfit. */
+function buildOutfitMenuItems(pet) {
+    const wardrobe = pet.petEntry.wardrobe;
+    if (pet.petEntry.builtIn || wardrobe === undefined)
+        return [];
+    const prefs = wardrobePreferenceFor(readManagedState(app.getPath("userData")), pet.petEntry.id);
+    const automatic = describeAutomaticOutfit(wardrobe, prefs, new Date());
+    const fixed = prefs?.outfit ?? autoOutfitId;
+    const items = [];
+    items.push({
+        label: `自动 · ${automatic}`,
+        type: "radio",
+        checked: fixed === autoOutfitId,
+        click: () => void setPetOutfitChoice(pet, autoOutfitId),
+    });
+    items.push({
+        label: "默认装",
+        type: "radio",
+        checked: fixed === defaultOutfitId,
+        click: () => void setPetOutfitChoice(pet, defaultOutfitId),
+    });
+    for (const outfit of wardrobe.outfits) {
+        items.push({
+            label: outfit.displayName,
+            type: "radio",
+            checked: fixed === outfit.id,
+            click: () => void setPetOutfitChoice(pet, outfit.id),
+        });
+    }
+    if (prefs?.schedule !== undefined) {
+        // Re-reading the creator schedule only matters when a user schedule was
+        // saved before; without one there is nothing to restore.
+        items.push({
+            label: "恢复作者排班",
+            click: () => void setPetOutfitChoice(pet, null, { schedule: null }),
+        });
+    }
+    return items;
+}
+/** Persist the outfit choice and re-render this pet's window. */
+async function setPetOutfitChoice(pet, outfit, extra = {}) {
+    if (pet.window.isDestroyed())
+        return;
+    const patch = {};
+    if (outfit !== undefined)
+        patch.outfit = outfit;
+    if (extra.schedule !== undefined)
+        patch.schedule = extra.schedule;
+    if (Object.keys(patch).length === 0)
+        return;
+    await updatePetWardrobePreference(app.getPath("userData"), pet.petEntry.id, patch);
+    await renderPetPage(pet, pet.petEntry).catch((error) => console.error("wardrobe re-render failed", error));
+    if (pet.window.isDestroyed())
+        return;
+    if (outfit === null || outfit === autoOutfitId)
+        say(pet, "已恢复自动换装");
+    else if (outfit === defaultOutfitId)
+        say(pet, "已换上默认装");
+    else
+        say(pet, `已换装：${pet.petEntry.wardrobe?.outfits.find((candidate) => candidate.id === outfit)?.displayName ?? outfit}`);
+    publishPanelState(pet);
+}
+// ---------------------------------------------------------------------------
+// Wardrobe schedule ticker
+// ---------------------------------------------------------------------------
+let wardrobeTimer;
+/**
+ * Re-render pets whose scheduled outfit just changed (e.g. 22:00 pajamas).
+ * One unref'd timer, re-armed just past each minute boundary; no per-pet
+ * timers. Sleep/resume self-corrects on the next tick.
+ */
+function armWardrobeTimer() {
+    const now = new Date();
+    const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes() + 1, 0, 50);
+    const delay = Math.max(1000, next.getTime() - Date.now());
+    wardrobeTimer = setTimeout(() => {
+        wardrobeTimer = undefined;
+        try {
+            tickWardrobes();
+        }
+        finally {
+            armWardrobeTimer();
+        }
+    }, delay);
+    wardrobeTimer.unref?.();
+}
+function tickWardrobes() {
+    for (const pet of pets.values()) {
+        if (pet.window.isDestroyed() || pet.petEntry.builtIn || pet.petEntry.wardrobe === undefined)
+            continue;
+        const plan = petRenderPlan(pet.petEntry);
+        if (plan.atlasPath === pet.wardrobeAtlasPath && plan.outfitId === pet.wardrobeOutfitId)
+            continue;
+        console.log(`[wardrobe] pet=${pet.petEntry.id} outfit ${pet.wardrobeOutfitId ?? "default"} -> ${plan.outfitId ?? "default"}`);
+        void renderPetPage(pet, pet.petEntry);
+    }
+}
+function stopWardrobeTimer() {
+    if (wardrobeTimer !== undefined)
+        clearTimeout(wardrobeTimer);
+    wardrobeTimer = undefined;
 }
 async function showPetContextMenu(pet) {
     const win = pet.window;
@@ -1066,8 +1317,10 @@ async function showPetContextMenu(pet) {
             }
         }
     }
+    const outfitItems = buildOutfitMenuItems(pet);
     const menu = Menu.buildFromTemplate([
         { label: "选择 model", submenu: modelItems },
+        ...(outfitItems.length > 0 ? [{ label: "换装", submenu: outfitItems }] : []),
         {
             label: "新建 session",
             click: () => {
@@ -1081,12 +1334,26 @@ async function showPetContextMenu(pet) {
             label: "清理无效会话",
             enabled: target !== undefined,
             click: () => {
+                if (win.isDestroyed())
+                    return;
                 void cleanupEmptySessions(pet);
             },
         },
         { type: "separator" },
-        { label: "关闭宠物", click: () => { win.hide(); } },
+        {
+            label: "关闭宠物",
+            click: () => {
+                if (win.isDestroyed())
+                    return;
+                win.hide();
+            },
+        },
     ]);
+    // Building the menu awaits service discovery, model and session lists. The
+    // pet window can be destroyed in that gap (e.g. the user closes it while the
+    // menu is still loading), and popup then throws "Object has been destroyed".
+    if (win.isDestroyed())
+        return;
     menu.popup({ window: win });
 }
 /**
@@ -1135,6 +1402,10 @@ function createPetWindow(options = {}) {
         idleRevertTimer: null,
         chatExpanded: false,
         panelWindow: null,
+        wardrobeOutfitId: undefined,
+        wardrobeAtlasPath: undefined,
+        walkTimer: null,
+        dragging: false,
     };
     pets.set(window.webContents.id, pet);
     focusedPetId = window.webContents.id;
@@ -1160,13 +1431,19 @@ function createPetWindow(options = {}) {
     window.webContents.on("did-finish-load", () => {
         sayWelcome(pet);
         publishPanelState(pet);
+        // Kick off the idle walk-about ticker after the page is live. sayWelcome
+        // already pushed a reaction, so the first walk waits for it to settle.
+        scheduleWalk(pet);
     });
-    void writePetPage(petEntry, window.webContents.id).then((filePath) => window.loadFile(filePath)).then(() => {
+    void renderPetPage(pet, petEntry)
+        .then(() => {
         window.show();
-    }).catch((error) => {
+    })
+        .catch((error) => {
         console.error("pet page load failed", error);
     });
     window.on("closed", () => {
+        cancelWalk(pet);
         if (pet.revertTimer)
             clearTimeout(pet.revertTimer);
         if (pet.idleRevertTimer)
@@ -1256,6 +1533,7 @@ async function petListItems() {
             spritesheetFileUrl: pathToFileURL(entry.spritesheetPath).toString(),
             builtIn: false,
             isDefault: entry.id === state.defaultPetId,
+            ...(entry.wardrobe !== undefined ? { outfitCount: entry.wardrobe.outfits.length } : {}),
         });
     }
     return items;
@@ -1481,8 +1759,45 @@ function installIpc() {
         const dy = typeof payload?.dy === "number" ? Math.round(payload.dy) : 0;
         if (dx === 0 && dy === 0)
             return;
+        pet.dragging = true;
+        cancelWalk(pet);
+        // Face the drag direction: dragging left plays running-left, right plays
+        // running-right. Tiny horizontal jitter is ignored so the pose does not
+        // flicker while dragging mostly vertically.
+        if (Math.abs(dx) >= 2) {
+            const facing = dx < 0 ? "running-left" : "running-right";
+            if (pet.lastSpriteState !== facing)
+                pushWalkState(pet, facing);
+        }
         win.setPosition(win.getBounds().x + dx, win.getBounds().y + dy);
     });
+    ipcMain.on("openpets:pet-drag-end", (event) => {
+        const pet = petForSender(event.sender);
+        if (pet === undefined)
+            return;
+        pet.dragging = false;
+        if (pet.window.isDestroyed())
+            return;
+        // Return to idle after the drag unless an agent reaction took over while
+        // the pointer was down (the reaction timer owns the state in that case).
+        if (pet.lastSpriteState === "running-left" || pet.lastSpriteState === "running-right") {
+            pet.lastSpriteState = "idle";
+            pet.window.webContents.send("openpets:pet-state", { state: "idle" });
+        }
+        scheduleWalk(pet);
+    });
+    async function applyDefaultPet(petId) {
+        const userData = app.getPath("userData");
+        await writeManagedState(userData, { defaultPetId: petId });
+        currentPetEntry = await resolveDefaultPet(userData);
+        // Reload every live pet page with the new default sprite.
+        for (const pet of pets.values()) {
+            if (pet.window.isDestroyed())
+                continue;
+            pet.petEntry = currentPetEntry;
+            void renderPetPage(pet, currentPetEntry);
+        }
+    }
     ipcMain.handle("pets:catalog-page", async (_event, page) => {
         try {
             const result = await getCatalogPage(typeof page === "number" ? page : 0);
@@ -1506,27 +1821,21 @@ function installIpc() {
         if (typeof petId !== "string" || petId.length === 0 || !/^[a-z0-9][a-z0-9_-]{0,127}$/.test(petId))
             return { ok: false, message: "非法的宠物 id" };
         const result = await installCatalogPet(app.getPath("userData"), petId);
+        if (result.ok && typeof result.id === "string") {
+            await applyDefaultPet(result.id);
+        }
         await refreshManagementWindow();
         return result;
     });
     ipcMain.handle("pets:select", async (_event, petId) => {
         if (typeof petId !== "string" || petId.length === 0)
             return { ok: false, message: "非法的宠物 id" };
-        const userData = app.getPath("userData");
         if (petId !== builtInPetEntry.id) {
-            const installed = await listInstalledPets(userData);
+            const installed = await listInstalledPets(app.getPath("userData"));
             if (!installed.some((entry) => entry.id === petId))
                 return { ok: false, message: `未安装 ${petId}` };
         }
-        await writeManagedState(userData, { defaultPetId: petId });
-        currentPetEntry = await resolveDefaultPet(userData);
-        // Reload every live pet page with the new default sprite.
-        for (const pet of pets.values()) {
-            if (pet.window.isDestroyed())
-                continue;
-            pet.petEntry = currentPetEntry;
-            void writePetPage(currentPetEntry, pet.window.webContents.id).then((filePath) => pet.window.loadFile(filePath));
-        }
+        await applyDefaultPet(petId);
         return { ok: true, message: "已设为默认" };
     });
     ipcMain.handle("pets:import-folder", async () => {
@@ -1537,7 +1846,12 @@ function installIpc() {
         });
         if (result.canceled || result.filePaths.length !== 1)
             return { ok: false, message: "已取消" };
-        return importPetFolder(app.getPath("userData"), result.filePaths[0]);
+        const imported = await importPetFolder(app.getPath("userData"), result.filePaths[0]);
+        if (imported.ok && typeof imported.id === "string") {
+            await applyDefaultPet(imported.id);
+        }
+        await refreshManagementWindow();
+        return imported;
     });
 }
 /**
@@ -1567,8 +1881,29 @@ else {
         dispatchSummon(request);
     });
 }
+// Log (instead of dialog-crash) anything escaping at shutdown or in stray
+// callbacks, so a quit-time failure never blindsides the user and always
+// leaves a trace we can diagnose.
+const crashLogPath = join(app.getPath("userData"), "main-crash.log");
+function appendCrashLog(kind, error) {
+    const when = new Date().toISOString();
+    const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+    try {
+        appendFileSync(crashLogPath, `[${when}] ${kind}: ${detail}\n`, "utf8");
+    }
+    catch {
+        // Logging must never be the thing that crashes the main process.
+    }
+    console.error(`[app-crash] ${kind}: ${detail}`);
+}
+process.on("uncaughtException", (error) => appendCrashLog("uncaughtException", error));
+process.on("unhandledRejection", (reason) => appendCrashLog("unhandledRejection", reason ?? "no reason"));
 void app.whenReady().then(async () => {
     installIpc();
+    armWardrobeTimer();
+    // Kick off OpenCode bring-up immediately (probe / install / service start);
+    // attachSession awaits the same memoized promise while pets draw.
+    void ensureOpenCodeReady();
     currentPetEntry = await resolveDefaultPet(app.getPath("userData"));
     createTray();
     const startupSummon = parseSummonRequest(process.argv);
@@ -1588,6 +1923,7 @@ app.on("window-all-closed", () => {
     app.quit();
 });
 app.on("quit", () => {
+    stopWardrobeTimer();
     watch?.stop();
     // Quitting ends every pet's session work and clears its timers.
     for (const pet of pets.values()) {

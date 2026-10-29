@@ -20,6 +20,8 @@ export interface PetListItem {
   readonly spritesheetFileUrl: string;
   readonly builtIn: boolean;
   readonly isDefault: boolean;
+  /** Present when the installed package ships wardrobe outfits. */
+  readonly outfitCount?: number;
 }
 
 export function buildPetListItems(installed: PetStoreEntry[], defaultPetId: string, builtInSpritesheetUrl: string): PetListItem[] {
@@ -43,6 +45,7 @@ export function buildPetListItems(installed: PetStoreEntry[], defaultPetId: stri
       spritesheetFileUrl: pathToFileURL(entry.spritesheetPath).toString(),
       builtIn: false,
       isDefault: entry.id === defaultPetId,
+      ...(entry.wardrobe !== undefined ? { outfitCount: entry.wardrobe.outfits.length } : {}),
     });
   }
   return items;
@@ -71,7 +74,7 @@ export function createManagementHtml(options: ManagementWindowOptions): string {
       return `<article class="card">
         ${preview}
         <h3>${escapeHtml(item.displayName)}</h3>
-        <p>${item.description ? escapeHtml(item.description) : "本机宠物包"}</p>
+        <p>${item.description ? escapeHtml(item.description) : "本机宠物包"}${item.outfitCount !== undefined ? ` · ${item.outfitCount} 套皮肤` : ""}</p>
         <div class="actions">${actions}</div>
       </article>`;
     })
@@ -203,12 +206,14 @@ export function createManagementHtml(options: ManagementWindowOptions): string {
       let pets;
       if (query) {
         const search = await window.petsManager.catalogSearch();
+        if (search.ok === false) throw new Error(search.error || "搜索失败");
         pagerLabel.textContent = "搜索结果 · 全商城";
         prevButton.disabled = true;
         nextButton.disabled = true;
         pets = search.pets ?? [];
       } else {
         const result = await window.petsManager.catalogPage(page);
+        if (result.ok === false) throw new Error(result.error || "商城加载失败");
         pageCount = result.pageCount;
         total = result.total;
         filters = result.filters;
@@ -232,11 +237,13 @@ export function createManagementHtml(options: ManagementWindowOptions): string {
   let filters = null;
 
   function renderChips(filters) {
+    const safe = filters || {};
+    const categories = Array.isArray(safe.categories) ? safe.categories : [];
     const defs = [
       { id: "all", label: "全部" },
-      { id: "original", label: "原创" + (filters.originalsCount ? " · " + filters.originalsCount : "") },
-      { id: "featured", label: "精选" + (filters.featuredCount ? " · " + filters.featuredCount : "") },
-      ...filters.categories.map((c) => ({ id: c.id, label: c.label + " · " + c.count })),
+      { id: "original", label: "原创" + (safe.originalsCount ? " · " + safe.originalsCount : "") },
+      { id: "featured", label: "精选" + (safe.featuredCount ? " · " + safe.featuredCount : "") },
+      ...categories.map((c) => ({ id: c.id, label: c.label + " · " + c.count })),
     ];
     chips.innerHTML = defs.map((def) => '<button type="button" class="chip' + (def.id === category ? " active" : "") + '" data-filter="' + def.id + '">' + def.label + "</button>").join("");
   }
@@ -290,7 +297,7 @@ export function createManagementHtml(options: ManagementWindowOptions): string {
       installButton.disabled = true;
       installButton.textContent = "安装中…";
       const result = await window.petsManager.catalogInstall(installButton.getAttribute("data-install"));
-      showStatus(result.ok ? result.message : "安装失败：" + result.message);
+      showStatus(result.ok ? (result.message || "安装完成") : "安装失败：" + (result.message || result.error || "未知错误"));
       if (result.ok) await loadShop();
       return;
     }

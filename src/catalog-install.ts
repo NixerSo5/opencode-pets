@@ -12,7 +12,7 @@ import { cp, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises
 import { join } from "node:path";
 import { isAbsolute } from "node:path";
 
-import { parsePetManifest, petsRoot } from "./pet-store.js";
+import { parsePetManifest, petsRoot, listInstalledPets } from "./pet-store.js";
 
 const maxZipBytes = 50 * 1024 * 1024;
 const maxExtractedBytes = 200 * 1024 * 1024;
@@ -116,9 +116,30 @@ export async function installCatalogPet(userDataPath: string, petId: string): Pr
       entry = page.pets.find((candidate) => candidate.id === petId) ?? entry;
     }
     if (!entry.zip) return { ok: false, message: `${entry.displayName} 没有可下载的 ZIP` };
-    if (entry.zip.length > 2048) return { ok: false, message: "下载地址非法" };
+    // Wardrobe packages ship the full outfit set; the plain `zip` keeps base
+    // compatibility. Prefer the wardrobe ZIP whenever the entry carries one.
+    const zipSources: { label: string; url: string }[] = entry.wardrobeZip !== undefined
+      ? [
+        { label: "wardrobe", url: entry.wardrobeZip },
+        { label: "base", url: entry.zip },
+      ]
+      : [{ label: "base", url: entry.zip }];
+    if (zipSources.some((source) => source.url.length > 2048)) return { ok: false, message: "下载地址非法" };
 
-    const buffer = await downloadZip({ zip: entry.zip });
+    let buffer: Buffer | undefined;
+    for (const source of zipSources) {
+      try {
+        buffer = await downloadZip({ zip: source.url });
+        console.log(`[catalog-install] pet=${petId} downloaded ${source.label} zip`);
+        break;
+      } catch (error) {
+        console.log(`[catalog-install] ${source.label} zip failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (buffer === undefined) {
+      const reason = zipSources.length > 1 ? `${zipSources[0].label} 与 ${zipSources[1].label} 包都下载失败` : "下载失败";
+      return { ok: false, message: reason };
+    }
     const staging = join(petsRoot(userDataPath), `.staging-${petId}`);
     await rm(staging, { recursive: true, force: true });
     await mkdir(staging, { recursive: true });
@@ -134,9 +155,26 @@ export async function installCatalogPet(userDataPath: string, petId: string): Pr
       const spritesheetStat = await stat(join(root, spritesheetRelative));
       if (!spritesheetStat.isFile()) return { ok: false, message: `精灵图缺失: ${spritesheetRelative}` };
       const destination = join(petsRoot(userDataPath), parsed.entry.id);
-      await rm(destination, { recursive: true, force: true });
-      await cp(root, destination, { recursive: true });
-      return { ok: true, message: `已安装 ${parsed.entry.displayName}`, id: parsed.entry.id };
+      try {
+        await rm(destination, { recursive: true, force: true });
+        await cp(root, destination, { recursive: true });
+      } catch (promoteError) {
+        const reason = promoteError instanceof Error ? promoteError.message : String(promoteError);
+        return { ok: false, message: `写入 ${destination} 失败: ${reason}` };
+      }
+      if (!(await stat(join(destination, "pet.json")).catch(() => undefined))?.isFile()) {
+        await rm(destination, { recursive: true, force: true });
+        return { ok: false, message: `安装后未找到 pet.json（目标目录: ${destination}）` };
+      }
+      const installed = await listInstalledPets(userDataPath).catch(() => []);
+      const found = installed.find((entry) => entry.id === parsed.entry.id);
+      if (found === undefined) {
+        await rm(destination, { recursive: true, force: true });
+        return { ok: false, message: "安装后的目录没有通过宠物校验（pet.json/精灵图）" };
+      }
+      const outfits = found.wardrobe?.outfits.length ?? 0;
+      const suffix = outfits > 0 ? `（含 ${outfits} 套皮肤）` : "";
+      return { ok: true, message: `已安装 ${found.displayName}${suffix}`, id: found.id };
     } finally {
       await rm(staging, { recursive: true, force: true });
     }

@@ -15,6 +15,8 @@ export interface PetListItem {
     readonly spritesheetFileUrl: string;
     readonly builtIn: boolean;
     readonly isDefault: boolean;
+    /** Present when the installed package ships wardrobe outfits. */
+    readonly outfitCount?: number;
 }
 export declare function buildPetListItems(installed: PetStoreEntry[], defaultPetId: string, builtInSpritesheetUrl: string): PetListItem[];
 export interface ManagementWindowOptions {

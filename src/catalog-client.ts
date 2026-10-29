@@ -20,6 +20,10 @@ export interface CatalogPetEntry {
   readonly spriteVersionNumber?: 1 | 2;
   /** Search-index-only field: which full catalog page holds the complete entry. */
   readonly catalogPage?: number;
+  /** Full package (pet.json + outfits/); preferred over `zip` when present. */
+  readonly wardrobeZip?: string;
+  /** Package needs an app at least this new (e.g. "4.1.0"). */
+  readonly minOpenPetsVersion?: string;
 }
 
 export interface CatalogFilters {
@@ -99,6 +103,8 @@ function parseCatalogEntry(raw: unknown): CatalogPetEntry | undefined {
     original: record.original === true,
     spriteVersionNumber: record.spriteVersionNumber === 2 ? 2 : record.spriteVersionNumber === 1 ? 1 : undefined,
     catalogPage: typeof record.catalogPage === "number" ? record.catalogPage : undefined,
+    wardrobeZip: typeof record.wardrobeZip === "string" ? record.wardrobeZip : undefined,
+    minOpenPetsVersion: typeof record.minOpenPetsVersion === "string" ? record.minOpenPetsVersion : undefined,
   };
 }
 

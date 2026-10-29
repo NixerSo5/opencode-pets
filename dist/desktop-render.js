@@ -388,8 +388,15 @@ export function createPetPageHtml(options = {}) {
     });
     function endPress(event) {
       if (!press) return;
-      const wasClick = !press.dragged && Date.now() - press.time < 600;
+      const wasDrag = press.dragged;
+      const wasClick = !wasDrag && Date.now() - press.time < 600;
       press = null;
+      if (wasDrag) {
+        // Tell main the drag is over so it stops showing the run pose and can
+        // resume the idle walk-about ticker.
+        window.openpetsDemo.dragEnd?.();
+        return;
+      }
       if (wasClick && Date.now() >= suppressClickUntil) {
         suppressClickUntil = Date.now() + 150;
         window.openpetsDemo.chatToggle();
