@@ -116,6 +116,8 @@ interface PetInstance {
   walkTimer: NodeJS.Timeout | null;
   /** True while a drag is in progress (suppresses reactions and walking). */
   dragging: boolean;
+  /** Display id the pet's page zoom was last synced against. */
+  displayId: number;
 }
 
 /** Keyed by `webContents.id`, which every IPC event carries. */
@@ -291,6 +293,65 @@ function applyReaction(pet: PetInstance | undefined, reaction: OpenPetsReaction 
 }
 
 /**
+ * Clamp a pet window's Y so the visible sprite — not the whole carrier —
+ * stays inside the work area. The carrier adds a transparent bubble strip
+ * (90px) plus an 8px margin above the sprite and an 8px margin below it, so
+ * those invisible strips may hang off the screen top and behind the
+ * taskbar; clamping the bare window instead would stop the pet's feet at
+ * roughly the vertical middle of the screen.
+ */
+function clampCarrierY(y: number, height: number, area: Electron.Rectangle): number {
+  const minY = area.y + 2 - BUBBLE_STRIP_HEIGHT - PET_WINDOW_MARGIN;
+  const maxY = area.y + area.height - 2 - height + PET_WINDOW_MARGIN;
+  return Math.min(Math.max(y, minY), Math.max(minY, maxY));
+}
+
+/**
+ * Per-display carrier geometry: the carrier's DIP size is fixed — the pet
+ * page lays out in CSS pixels that exactly fill it, so keeping these
+ * constants across monitors with different DPI scales (100% side screens vs
+ * a 125% laptop panel) keeps the sprite fully visible everywhere. The only
+ * thing cross-DPI moves need is putting the size back when Chromium
+ * re-anchors it (see the drag handler / walkOnce).
+ */
+
+/** Bring one pet window's size back to the fixed carrier size. */
+function restoreCarrierSize(pet: PetInstance): void {
+  if (pet.window.isDestroyed()) return;
+  const after = pet.window.getBounds();
+  if (after.width !== collapsedWindowSize.width || after.height !== collapsedWindowSize.height) {
+    // Keep the sprite's bottom edge where it is: the sprite sits at the
+    // window bottom (8px margin), so re-anchoring from the bottom stops the
+    // pet visibly jumping under the user's pointer.
+    const bottom = after.y + after.height - PET_WINDOW_MARGIN;
+    const area = workAreaForPoint({ x: after.x + Math.floor(after.width / 2), y: bottom });
+    pet.window.setBounds({
+      x: after.x + Math.round((after.width - collapsedWindowSize.width) / 2),
+      y: clampCarrierY(bottom - collapsedWindowSize.height + PET_WINDOW_MARGIN, collapsedWindowSize.height, area),
+      width: collapsedWindowSize.width,
+      height: collapsedWindowSize.height,
+    });
+  }
+}
+
+/**
+ * Reset the page zoom anchor after a display change.
+ *
+ * Chromium auto-compensates page zoom when a window lands on a monitor with
+ * a different DPI scale (anchored to the monitor seen at creation), which
+ * drifts `devicePixelRatio` away from the screen scale and makes the sprite
+ * shrink or crop on every crossing. Pinning the zoom to 1/scaleFactor keeps
+ * the page at devicePixelRatio 1: one physical sprite size on every screen,
+ * exactly filling the fixed-size carrier.
+ */
+function syncPetDisplay(pet: PetInstance, display: Electron.Display): void {
+  if (pet.window.isDestroyed() || pet.displayId === display.id) return;
+  pet.displayId = display.id;
+  const scale = display.scaleFactor > 0 ? display.scaleFactor : 1;
+  pet.window.webContents.setZoomFactor(1 / scale);
+}
+
+/**
  * Show a directional walk pose without touching the reaction/revert machinery.
  * Used by drag feedback and the idle walk-about ticker; both are "cosmetic"
  * states that must not schedule a revert or clobber an agent reaction.
@@ -335,17 +396,39 @@ async function walkOnce(pet: PetInstance): Promise<void> {
   const distance = 24 + Math.round(Math.random() * 40);
   pushWalkState(pet, right ? "running-right" : "running-left");
   const start = win.getBounds();
-  const target = clampPointToWorkArea(
-    { x: start.x + (right ? distance : -distance), y: start.y },
-    { width: start.width, height: start.height },
-  );
+  // Clamp against the display the pet currently lives on, keyed from the
+  // window centre. The helper clampPointToWorkArea() picks the display
+  // nearest the *target* point instead, so a pet near a screen edge could
+  // have its walk target clamped into a neighbouring monitor (or a
+  // coordinate gap between monitors) and silently walk off the visible
+  // desktop. Staying on the home display keeps the pet on screen.
+  const homeArea = workAreaForPoint({
+    x: start.x + Math.floor(start.width / 2),
+    y: start.y + Math.floor(start.height / 2),
+  });
+  syncPetDisplay(pet, screen.getDisplayNearestPoint({
+    x: start.x + Math.floor(start.width / 2),
+    y: start.y + Math.floor(start.height / 2),
+  }));
+  const clampWalkX = (x: number): number =>
+    Math.min(Math.max(x, homeArea.x + 2), Math.max(homeArea.x + 2, homeArea.x + homeArea.width - collapsedWindowSize.width - 2));
+  // Same sprite-based rule as dragging (clampCarrierY): the transparent
+  // bubble strip above the sprite may hang off the screen top, so the walk
+  // keeps the pet's feet inside the work area instead of pinning the whole
+  // carrier window inside it.
+  const clampWalkY = (y: number): number => clampCarrierY(y, collapsedWindowSize.height, homeArea);
+  const startY = clampWalkY(start.y);
+  const targetX = clampWalkX(start.x + (right ? distance : -distance));
   const steps = 12;
-  const stepX = (target.x - start.x) / steps;
+  const stepX = (targetX - start.x) / steps;
   for (let i = 0; i < steps; i += 1) {
     if (win.isDestroyed() || pet.dragging) break;
     if (pet.lastSpriteState !== "running-left" && pet.lastSpriteState !== "running-right") break;
     const bounds = win.getBounds();
-    win.setPosition(Math.round(bounds.x + stepX), bounds.y);
+    // Re-clamp every step so rounding drift or a drag that raced the walk
+    // cannot accumulate past the home display's edge either.
+    win.setPosition(Math.round(clampWalkX(bounds.x + stepX)), Math.round(clampWalkY(bounds.y)));
+    restoreCarrierSize(pet);
     await new Promise((resolve) => setTimeout(resolve, 90));
   }
   if (win.isDestroyed()) return;
@@ -1425,9 +1508,13 @@ async function showPetContextMenu(pet: PetInstance): Promise<void> {
  * window, so a new session always gets its own pet.
  */
 function createPetWindow(options: { directory?: string; position?: { x: number; y: number }; petEntry?: PetStoreEntry } = {}): PetInstance {
+  const petEntry = options.petEntry ?? currentPetEntry;
+  // The carrier's DIP size is fixed on every monitor: the pet page lays out
+  // in CSS pixels that exactly fill it, so the sprite is always fully
+  // visible and any cross-DPI rescaling is undone after moves (see
+  // restoreCarrierSize).
   const width = collapsedWindowSize.width;
   const height = collapsedWindowSize.height;
-  const petEntry = options.petEntry ?? currentPetEntry;
   const window = new BrowserWindow({
     title: "OpenPets pet",
     width,
@@ -1470,9 +1557,22 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
     wardrobeAtlasPath: undefined,
     walkTimer: null,
     dragging: false,
+    displayId: -1,
   };
   pets.set(window.webContents.id, pet);
   focusedPetId = window.webContents.id;
+  // (Re)pin the page zoom after every load: the renderer reloads for outfit
+  // changes, and each load lets Chromium re-anchor the zoom to the creation
+  // display's scale, which would make the pet resize on the other monitors.
+  window.webContents.on("did-finish-load", () => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    const b = window.getBounds();
+    const target = screen.getDisplayNearestPoint({ x: b.x, y: b.y });
+    const scale = target.scaleFactor > 0 ? target.scaleFactor : 1;
+    pet.displayId = target.id;
+    window.webContents.setZoomFactor(1 / scale);
+  });
+  syncPetDisplay(pet, screen.getDisplayNearestPoint({ x: window.getBounds().x, y: window.getBounds().y }));
   // NOTE: the pet window intentionally does NOT close the panel on blur. The
   // panel is a separate window that takes focus when it opens, so a pet blur
   // fires immediately on open and used to close the panel instantly (the
@@ -1801,7 +1901,34 @@ function installIpc(): void {
       const facing = dx < 0 ? "running-left" : "running-right";
       if (pet.lastSpriteState !== facing) pushWalkState(pet, facing);
     }
-    win.setPosition(win.getBounds().x + dx, win.getBounds().y + dy);
+    // Clamping policy while dragging:
+    //   x — the whole virtual desktop (union of every display's work area),
+    //       so the pet can be carried across monitors but not past the
+    //       leftmost / rightmost screen edge;
+    //   y — sprite-based: the visible sprite must stay inside the work area
+    //       of the display under the window centre, while the transparent
+    //       bubble strip above it may hang off the screen top (otherwise the
+    //       pet's feet could only ever reach the vertical middle).
+    // The carrier's DIP size is fixed (collapsedWindowSize) on every monitor;
+    // after the move, put the size back in case the crossing re-anchored it.
+    const bounds = win.getBounds();
+    const target = screen.getDisplayNearestPoint({
+      x: bounds.x + Math.floor(bounds.width / 2) + dx,
+      y: bounds.y + Math.floor(bounds.height / 2) + dy,
+    });
+    const area = target.workArea;
+    const desktop = screen.getAllDisplays().reduce(
+      (acc, display) => ({
+        minX: Math.min(acc.minX, display.workArea.x),
+        maxX: Math.max(acc.maxX, display.workArea.x + display.workArea.width),
+      }),
+      { minX: Infinity, maxX: -Infinity },
+    );
+    const x = Math.min(Math.max(bounds.x + dx, desktop.minX + 2), Math.max(desktop.minX + 2, desktop.maxX - collapsedWindowSize.width - 2));
+    const y = clampCarrierY(bounds.y + dy, collapsedWindowSize.height, area);
+    win.setPosition(x, y);
+    restoreCarrierSize(pet);
+    syncPetDisplay(pet, target);
   });
   ipcMain.on("openpets:pet-drag-end", (event) => {
     const pet = petForSender(event.sender);
