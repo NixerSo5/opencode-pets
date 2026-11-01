@@ -56,6 +56,7 @@ import {
 } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { ensureOpenCodeService, type EnsureResult } from "./opencode-ensure.js";
+import { readSessionRecords, readActiveRecord, saveSessionRecord, sessionRecordKey } from "./session-record.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor, type SummonRequest } from "./summon.js";
 
 const scale = 0.75;
@@ -705,6 +706,26 @@ function resolveTurnWaiters(sessionID: string, kind: TurnCompletionKind): void {
   for (const waiter of waiters) waiter(kind);
 }
 
+/**
+ * Mirror the server's session title into the pet.
+ *
+ * Sessions are created without a title so OpenCode can auto-name them from
+ * the first turn; the folder label is only a pet-side placeholder until
+ * then. Called after every terminal turn event, when the server has
+ * finished titling the conversation.
+ */
+async function syncSessionTitle(pet: PetInstance): Promise<void> {
+  if (pet.window.isDestroyed() || pet.endpoint === undefined || pet.sessionID === undefined) return;
+  const session = await getSession(pet.endpoint, pet.sessionID).catch(() => undefined);
+  if (session === undefined) return;
+  if (session.title !== undefined && session.title !== pet.sessionTitle) {
+    pet.sessionTitle = session.title;
+    void saveSessionRecord(app.getPath("userData"), pet.directory, { sessionID: session.id, title: session.title });
+    console.log(`[session] title synced: ${session.title}`);
+    publishPanelState(pet);
+  }
+}
+
 function handleWatchStatus(update: { sessionID: string; status: "running" | "idle"; kind: "started" | "succeeded" | "failed" | "interrupted" | "enqueued" | "waiting"; tool?: string }): void {
   // Terminal states end waiting turns even when the pet is gone; reactions
   // below only matter for bound pets.
@@ -713,6 +734,12 @@ function handleWatchStatus(update: { sessionID: string; status: "running" | "idl
   }
   const pet = petForSession(update.sessionID);
   if (pet === undefined) return;
+  // The server titles a session right after its first turn; refresh the pet
+  // copy after terminal events so the panel header follows the real title,
+  // not the folder placeholder.
+  if (update.kind === "succeeded" || update.kind === "failed" || update.kind === "interrupted") {
+    void syncSessionTitle(pet);
+  }
   const label = pet.sessionTitle ?? "session";
   // Finished work is worth a Windows toast: the user may have switched away
   // while the pet was thinking. Only terminal "succeeded" notifications fire;
@@ -880,11 +907,40 @@ function startWatch(): void {
   watch.start();
 }
 
+/** Model every new session starts on unless the user explicitly switches it. */
+const defaultSessionModel = { providerID: "opencode", id: "big-pickle" } as const;
+
+/** Pin the default model on a fresh session; best-effort, never blocks attach. */
+async function pinDefaultModel(endpoint: ServiceEndpoint, sessionID: string): Promise<void> {
+  try {
+    await setSessionModel(endpoint, sessionID, defaultSessionModel);
+    const confirmed = await getSessionAfterModelSwitch(endpoint, sessionID, defaultSessionModel);
+    const final = confirmed.model;
+    if (final === undefined || final.providerID !== defaultSessionModel.providerID || final.id !== defaultSessionModel.id) {
+      console.log(`[model] default pin not confirmed for session=${sessionID}`);
+    } else {
+      console.log(`[model] default model pinned (${defaultSessionModel.providerID}/${defaultSessionModel.id}) session=${sessionID}`);
+    }
+  } catch (error) {
+    console.log(`[model] default pin failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 /**
- * Give this pet its own brand-new session for `directory`. Every pet owns
- * exactly one session, so this never reuses an existing one.
+ * Give this pet its own session for `directory`.
+ *
+ * By default the session recorded for that directory (sessions.json) is
+ * reattached, so closing the app does not orphan the conversation; a new
+ * session is only created when nothing was recorded, the record points at a
+ * session the server no longer knows, or another live pet owns it. Summons
+ * and plain launch both use the default path; only "新建 session" passes
+ * `forceNew` because it explicitly asks for a fresh conversation.
  */
-async function attachSession(pet: PetInstance, directory: string): Promise<{ ok: boolean; message?: string }> {
+async function attachSession(
+  pet: PetInstance,
+  directory: string,
+  options: { forceNew?: boolean } = {},
+): Promise<{ ok: boolean; message?: string }> {
   // Bring install + service-start into the same memoized promise so a failed
   // ensure is retried on the next attach instead of caching a failure.
   const ready = await ensureOpenCodeReady();
@@ -896,12 +952,40 @@ async function attachSession(pet: PetInstance, directory: string): Promise<{ ok:
   pet.endpoint = discovered;
   pet.directory = directory;
   startWatch();
+  if (options.forceNew !== true) {
+    const record = (await readSessionRecords(app.getPath("userData")))[sessionRecordKey(directory)];
+    if (record !== undefined) {
+      const owner = petForSession(record.sessionID);
+      const existing = await getSession(discovered, record.sessionID).catch(() => undefined);
+      if (existing !== undefined && (owner === undefined || owner === pet)) {
+        pet.sessionID = existing.id;
+        pet.sessionTitle = existing.title ?? record.title;
+        // A restored session may never have had a model pinned; give it the
+        // default one instead of leaving OpenCode to pick.
+        if (existing.model === undefined) void pinDefaultModel(discovered, existing.id);
+        // Touch the record so the "most recently active" pointer follows the
+        // pet the user is actually talking through now.
+        void saveSessionRecord(app.getPath("userData"), directory, { sessionID: existing.id, title: pet.sessionTitle });
+        watch?.track({ id: pet.sessionID, title: pet.sessionTitle, directory });
+        console.log(`[summon-debug] reattached recorded session=${pet.sessionID}`);
+        return { ok: true, message: `已恢复会话：${pet.sessionTitle}` };
+      }
+      console.log(`[summon-debug] recorded session ${record.sessionID} unavailable; creating a new one`);
+    }
+  }
   try {
-    console.log(`[summon-debug] createSession with directory=${directory} title=${sessionLabel(directory)}`);
-    const session = await createSession(discovered, directory, sessionLabel(directory));
+    console.log(`[summon-debug] createSession with directory=${directory}`);
+    // No title: OpenCode auto-names the session from the first turn; the
+    // folder label below is only a placeholder for the pet until then.
+    const session = await createSession(discovered, directory);
     console.log(`[summon-debug] createSession returned id=${session.id} location=${JSON.stringify(session.location)}`);
     pet.sessionID = session.id;
     pet.sessionTitle = session.title ?? sessionLabel(directory);
+    // New sessions start on the default model (the session's own model is the
+    // single source of truth afterwards; user switches always win).
+    void pinDefaultModel(discovered, session.id);
+    // Record the binding so the next launch restores this conversation.
+    void saveSessionRecord(app.getPath("userData"), directory, { sessionID: session.id, title: pet.sessionTitle });
     watch?.track({ id: session.id, title: pet.sessionTitle, directory });
     return { ok: true, message: `已创建会话：${pet.sessionTitle}` };
   } catch (error) {
@@ -1050,11 +1134,25 @@ async function followReply(target: ServiceEndpoint, sessionID: string, promptTex
 
 /**
  * Bind a session without moving the window, used on plain launch so the chat
- * panel works even when the pet was not summoned from Explorer. Silent on
- * failure: the user only learns about it when they try to send a message.
+ * panel works even when the pet was not summoned from Explorer. The pet sits
+ * on the desktop, but the conversation restored is the one the user last
+ * worked in, whatever folder it was recorded for. Silent on failure: the
+ * user only learns about it when they try to send a message.
  */
 async function connectDefault(pet: PetInstance): Promise<void> {
-  const result = await attachSession(pet, desktopDirectory());
+  let directory = desktopDirectory();
+  const ready = await ensureOpenCodeReady();
+  if (ready.ok && ready.endpoint !== undefined) {
+    const active = await readActiveRecord(app.getPath("userData"));
+    if (active !== undefined) {
+      const owner = petForSession(active.record.sessionID);
+      const existing = await getSession(ready.endpoint, active.record.sessionID).catch(() => undefined);
+      // Reroute only when the recorded conversation is genuinely resumable;
+      // stale records must not start stray sessions in a foreign directory.
+      if (existing !== undefined && (owner === undefined || owner === pet)) directory = active.directory;
+    }
+  }
+  const result = await attachSession(pet, directory);
   if (result.ok) say(pet, `${pet.sessionTitle ?? ""} · 已连接`);
   else console.log(`[opencode] startup connect failed: ${result.message ?? "unknown"}`);
 }
@@ -1078,7 +1176,10 @@ async function runSummon(pet: PetInstance, request: SummonRequest): Promise<void
   }
   sayWelcome(pet);
   console.log(`[summon-debug] runSummon request.directory=${request.directory}`);
-  const result = await attachSession(pet, request.directory);
+  // Summoning restores the conversation recorded for this folder when it is
+  // still servable on the server, so closing and re-summoning the pet keeps
+  // the chat going; "新建 session" passes forceNew for a genuinely fresh one.
+  const result = await attachSession(pet, request.directory, { forceNew: request.forceNew === true });
   say(pet, result.ok ? `${sessionLabel(request.directory)} · ${result.message ?? ""}` : `召唤失败：${result.message ?? "未知错误"}`);
   publishPanelState(pet);
 }
@@ -1457,6 +1558,9 @@ async function showPetContextMenu(pet: PetInstance): Promise<void> {
             pet.sessionID = session.id;
             pet.sessionTitle = session.title ?? sessionLabel(directory);
             pet.directory = directory;
+            // Following the switch, the recorded binding moves to the new
+            // session so the next launch restores what the user last chose.
+            void saveSessionRecord(app.getPath("userData"), directory, { sessionID: session.id, title: pet.sessionTitle });
             watch?.track({ id: session.id, title: pet.sessionTitle, directory });
             say(pet, `已切换会话：${pet.sessionTitle}`);
             publishPanelState(pet);
@@ -1475,7 +1579,7 @@ async function showPetContextMenu(pet: PetInstance): Promise<void> {
       click: () => {
         // A new session gets its own new pet window (one pet per session) and
         // the next appearance in rotation, so it does not look identical.
-        void dispatchSummon({ directory: pet.directory ?? desktopDirectory() });
+        void dispatchSummon({ directory: pet.directory ?? desktopDirectory(), forceNew: true });
       },
     },
     { label: "选择 session", submenu: sessionItems },
@@ -1800,8 +1904,19 @@ function installIpc(): void {
     if (text.length > 4000) return { ok: false, error: "消息太长（上限 4000 字）" };
     const pet = petForPanelSender(event.sender);
     if (pet === undefined) return { ok: false, error: "宠物已关闭" };
-    const sessionID = pet.sessionID;
-    if (sessionID === undefined) return { ok: false, error: "当前宠物还没有绑定会话，请稍候或重新召唤" };
+    let sessionID = pet.sessionID;
+    if (sessionID === undefined) {
+      // OpenCode may not have been running when this pet launched (or the
+      // startup connect failed). Attach now: it probes the service, installs
+      // opencode if missing, runs `opencode service start`, and binds or
+      // restores a session for this pet's directory — no manual re-summon.
+      const attached = await attachSession(pet, pet.directory);
+      sessionID = pet.sessionID;
+      if (!attached.ok || sessionID === undefined) {
+        return { ok: false, error: attached.message ?? "OpenCode 服务不可用" };
+      }
+      publishPanelState(pet);
+    }
     // Plan A: run the turn straight over the HTTP API the OpenCode web app uses.
     // The prompt never carries a model — the session's own model decides every
     // turn, so the pet cannot implicitly override model selection — and a

@@ -18,6 +18,8 @@ export interface SummonRequest {
   readonly directory: string;
   readonly x?: number;
   readonly y?: number;
+  /** True when the ask is explicitly for a fresh conversation, not a restore. */
+  readonly forceNew?: boolean;
 }
 
 const SUMMON_FLAG = "--summon";

@@ -13,6 +13,8 @@ export interface SummonRequest {
     readonly directory: string;
     readonly x?: number;
     readonly y?: number;
+    /** True when the ask is explicitly for a fresh conversation, not a restore. */
+    readonly forceNew?: boolean;
 }
 export declare function desktopDirectory(): string;
 /** Parse argv (without the electron/exe prefix). Returns undefined when not a summon. */
