@@ -26,7 +26,13 @@ export type DownloadProgress = (received: number, total: number) => void;
 export declare function isPortableInstall(): boolean;
 export declare function parseSemver(value: string): [number, number, number] | undefined;
 export declare function isNewerVersion(candidate: string, current: string): boolean;
-/** Query the GitHub API; undefined (no error detail) when nothing newer. */
+/**
+ * Check for a newer release, Gitee first.
+ *
+ * The Gitee mirror is the primary source in CN; when it is unreachable or has
+ * no published release we ask GitHub. Portable installs always need the
+ * GitHub asset, so a Gitee hit still fetches the GitHub release as a fallback.
+ */
 export declare function checkForUpdate(current: string): Promise<UpdateInfo | undefined>;
 export interface GiteeVolume {
     readonly name: string;

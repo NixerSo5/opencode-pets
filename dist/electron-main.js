@@ -402,7 +402,12 @@ function publishPanelState(pet) {
         return;
     // The panel owns its header now; push the bound session title there so a
     // session switch updates it without waiting for a history round-trip.
-    const updatePayload = updateInfo === undefined ? undefined : { version: updateInfo.latest, status: updateStatus };
+    // `checked: false` means "not asked yet"; the panel must distinguish that
+    // from "asked and current", otherwise a dismissed badge can never be cleared.
+    const updatePayload = updateInfo === undefined
+        ? { checked: updateChecked, version: undefined, status: "" }
+        : { checked: true, version: updateInfo.latest, status: updateStatus };
+    console.log(`[panel-state] updateInfo=${updateInfo === undefined ? "undefined" : updateInfo.latest} updateChecked=${updateChecked} updateStatus=${JSON.stringify(updateStatus)} => ${JSON.stringify(updatePayload)}`);
     if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
         pet.panelWindow.webContents.send("openpets:pet-panel-state", {
             chatExpanded: pet.chatExpanded,
@@ -443,6 +448,7 @@ function ensurePanelWindow(pet) {
         return pet.panelWindow;
     if (pet.window.isDestroyed())
         return null;
+    pet.panelReady = undefined;
     const size = panelSizeFor(pet.window.getBounds());
     const panel = new BrowserWindow({
         title: "OpenPets chat",
@@ -481,8 +487,19 @@ function ensurePanelWindow(pet) {
     // Esc and the in-panel close button both hide the panel; nothing about the
     // pet or its session changes.
     panel.webContents.on("before-input-event", (_event, input) => {
-        if (input.type === "keyDown" && input.key === "Escape")
+        if (input.type !== "keyDown")
+            return;
+        if (input.key === "Escape") {
             setChatExpanded(pet, false);
+            return;
+        }
+        // Dev aid: F12 or Ctrl+Shift+I toggles the panel DevTools. Harmless in
+        // production; the dev runner (`npm run dev`) relies on it heavily.
+        const isDevToolsKey = input.key === "F12" ||
+            (input.control && input.shift && (input.key === "I" || input.key === "i"));
+        if (isDevToolsKey) {
+            panel.webContents.toggleDevTools();
+        }
     });
     // Popconfirm semantics: clicking outside the panel dismisses it. This lives
     // on the panel rather than on the pet because the panel owns focus while it
@@ -492,11 +509,20 @@ function ensurePanelWindow(pet) {
     // being activated for the first time, which otherwise closes the panel
     // moments after opening it.
     let panelHasFocused = false;
+    // `show()` + `focus()` on Windows often emits a spurious blur before the
+    // window actually gains foreground activation; that blur would close the
+    // panel moments after opening it. Ignore blurs for a short grace period
+    // after the panel is first shown.
+    let panelShownAt = 0;
+    const BLUR_GRACE_MS = 600;
+    panel.on("show", () => { panelShownAt = Date.now(); });
     panel.on("focus", () => { panelHasFocused = true; });
     panel.on("blur", () => {
         if (!panelHasFocused)
             return;
         if (!pet.chatExpanded)
+            return;
+        if (Date.now() - panelShownAt < BLUR_GRACE_MS)
             return;
         // Give the click a chance to land on the pet (which toggles the panel
         // itself) or on the panel again before deciding the user clicked away.
@@ -505,10 +531,19 @@ function ensurePanelWindow(pet) {
                 return;
             if (panel.isDestroyed())
                 return;
+            // The pet being hidden (关闭宠物) or minimised is not a click-away: the
+            // user dismissed the carrier, not the conversation.
+            if (!pet.window.isVisible() || pet.window.isMinimized())
+                return;
             if (panel.isFocused())
                 return;
             const focused = BrowserWindow.getFocusedWindow();
             if (focused !== null && focused === pet.window)
+                return;
+            // A focused DevTools window (docked or detached) is not a click-away:
+            // keep the panel open so the inspector survives. `isDevToolsFocused()`
+            // is the supported check and covers the detached DevTools window.
+            if (panel.webContents.isDevToolsFocused())
                 return;
             setChatExpanded(pet, false);
         }, 120);
@@ -516,14 +551,23 @@ function ensurePanelWindow(pet) {
     panel.webContents.on("console-message", (_event, level, message) => {
         console.log(`[panel:${level}] ${message}`);
     });
+    // Load the page before the caller is allowed to show it: the panel HTML is
+    // rendered to disk on every open, so `show()` / `send()` must not race the
+    // `writeFile` + `loadFile` pair. `panelReady` resolves once the document is
+    // live and `rendererReady` resolves after the renderer signals it has wired
+    // its IPC listeners, so no state push can be dropped on the floor.
     const dir = join(app.getPath("userData"), "rendered-pets");
-    void mkdir(dir, { recursive: true })
+    const panelReady = mkdir(dir, { recursive: true })
         .then(() => {
         const filePath = join(dir, `standalone-panel-${pet.window.webContents.id}.html`);
         return writeFile(filePath, createPanelPageHtml({ petName: pet.petEntry.displayName }), "utf8").then(() => filePath);
     })
         .then((filePath) => panel.loadFile(filePath))
-        .catch((error) => console.error("panel page load failed", error));
+        .catch((error) => {
+        console.error("panel page load failed", error);
+        throw error;
+    });
+    pet.panelReady = panelReady;
     return panel;
 }
 /**
@@ -588,13 +632,30 @@ function say(pet, text) {
  * Map OpenCode session events onto pet reactions. Only the session this pet
  * owns is animated, so a busy TUI session elsewhere stays invisible here.
  */
-/** Find the pet that owns a session id (each session has at most one pet). */
+/**
+ * Find the pet that owns a session id (each session has at most one pet).
+ *
+ * A pet hidden via 「关闭宠物」 still lives in `pets` and keeps its session
+ * bound, but it is not what the user is talking through any more. Prefer a
+ * visible owner and only fall back to a hidden one when no visible pet holds
+ * the session: otherwise a dismissed pet would keep the conversation "taken"
+ * and the next summon for the same folder would create a brand-new session and
+ * overwrite the recorded binding.
+ */
 function petForSession(sessionID) {
+    let hidden;
     for (const pet of pets.values()) {
-        if (pet.sessionID === sessionID)
+        if (pet.sessionID !== sessionID)
+            continue;
+        if (!pet.window.isDestroyed() && pet.window.isVisible())
             return pet;
+        hidden ??= pet;
     }
-    return undefined;
+    return hidden;
+}
+/** Whether `pet` is one the user can currently see and interact with. */
+function petIsVisible(pet) {
+    return !pet.window.isDestroyed() && pet.window.isVisible();
 }
 const pendingForms = new Map();
 const turnWaiters = new Map();
@@ -863,8 +924,13 @@ async function attachSession(pet, directory, options = {}) {
         const record = (await readSessionRecords(app.getPath("userData")))[sessionRecordKey(directory)];
         if (record !== undefined) {
             const owner = petForSession(record.sessionID);
+            // A hidden pet (dismissed with 关闭宠物) still holds this id in memory;
+            // it must not block the pet the user is actually looking at from taking
+            // the conversation back, or the recorded binding would be replaced by a
+            // fresh empty session and the history would look lost.
+            const ownerBlocking = owner !== undefined && owner !== pet && petIsVisible(owner);
             const existing = await getSession(discovered, record.sessionID).catch(() => undefined);
-            if (existing !== undefined && (owner === undefined || owner === pet)) {
+            if (existing !== undefined && !ownerBlocking) {
                 pet.sessionID = existing.id;
                 pet.sessionTitle = existing.title ?? record.title;
                 // A restored session may never have had a model pinned; give it the
@@ -907,6 +973,8 @@ async function attachSession(pet, directory, options = {}) {
 let updateInfo;
 /** "" 空闲 / "下载中 43%" / "已下载，正在退出并安装…"，展示在面板更新条上。 */
 let updateStatus = "";
+/** Whether at least one update check finished (so "no update" is a real answer). */
+let updateChecked = false;
 /** Push the current update bar text onto every pet's chat panel. */
 function publishUpdateStatus() {
     for (const pet of pets.values())
@@ -916,11 +984,20 @@ function publishUpdateStatus() {
 async function runUpdateCheck(announceTo) {
     const info = await checkForUpdate(app.getVersion());
     if (info === undefined) {
+        // Clear any stale badge. `publishPanelState` reports `undefined` when there
+        // is no update, and the panel keeps whatever it rendered last, so a
+        // "checked, nothing newer" pass must be pushed explicitly or the update bar
+        // stays on screen forever.
+        updateInfo = undefined;
+        updateStatus = "";
+        updateChecked = true;
+        publishUpdateStatus();
         if (announceTo !== undefined)
             say(announceTo, `当前已是最新版本（v${app.getVersion()}）`);
         return;
     }
     updateInfo = info;
+    updateChecked = true;
     for (const pet of pets.values())
         say(pet, `发现新版本 v${info.latest}！在对话面板或右键菜单都可以更新`);
     publishUpdateStatus();
@@ -1260,28 +1337,46 @@ function setChatExpanded(pet, next) {
             pet.chatExpanded = false;
             return;
         }
+        // The panel may still be writing its HTML and loading it. Waiting for the
+        // document keeps `show()`/`send()` from running against a blank renderer,
+        // which used to leave a stale page (old update bar) on screen.
+        const ready = pet.panelReady ?? Promise.resolve();
         // Anchor on the sprite, not the whole carrier window: the window reserves a
         // 90px strip above the sprite for the bubble plus an 8px margin, so using
         // its raw bounds would push the panel noticeably away from the pet.
-        const anchor = petSpriteBounds(petWin.getBounds());
-        const size = panelSizeFor(anchor);
-        const area = workAreaForPoint({ x: anchor.x + Math.floor(anchor.width / 2), y: anchor.y + Math.floor(anchor.height / 2) });
-        const bounds = computePanelBounds(anchor, size, area);
-        console.log(`[pet] panel placement ${bounds.placement.side}/${bounds.placement.align} at ${JSON.stringify({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height })}`);
-        panel.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, false);
-        // Show with focus: `showInactive` left the panel unable to receive keyboard
-        // input, so the composer could never be typed into. The pet window itself
-        // keeps its own focus behavior; focusing the panel is what lets the user
-        // type immediately after opening it.
-        panel.show();
-        panel.focus();
-        panel.webContents.send("openpets:pet-panel-state", {
-            chatExpanded: true,
-            sessionTitle: pet.sessionTitle ?? "",
+        void ready
+            .catch(() => undefined)
+            .then(() => {
+            if (panel.isDestroyed())
+                return;
+            if (pet.panelWindow !== panel)
+                return;
+            if (!pet.chatExpanded)
+                return;
+            const anchor = petSpriteBounds(petWin.getBounds());
+            const size = panelSizeFor(anchor);
+            const area = workAreaForPoint({ x: anchor.x + Math.floor(anchor.width / 2), y: anchor.y + Math.floor(anchor.height / 2) });
+            const bounds = computePanelBounds(anchor, size, area);
+            console.log(`[pet] panel placement ${bounds.placement.side}/${bounds.placement.align} at ${JSON.stringify({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height })}`);
+            panel.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }, false);
+            // Show with focus: `showInactive` left the panel unable to receive
+            // keyboard input, so the composer could never be typed into.
+            panel.show();
+            panel.focus();
+            panel.webContents.send("openpets:pet-panel-state", {
+                chatExpanded: true,
+                sessionTitle: pet.sessionTitle ?? "",
+            });
+            publishPanelState(pet);
         });
     }
     else if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
-        pet.panelWindow.hide();
+        // Destroy, not hide: a lingering panel window keeps renderer resources and
+        // an IPC surface alive for a conversation the user just dismissed, and its
+        // stale `petPanelState` could be re-shown by an unrelated call.
+        const stale = pet.panelWindow;
+        pet.panelWindow = null;
+        stale.destroy();
     }
     publishPanelState(pet);
 }
@@ -1599,11 +1694,12 @@ async function showPetContextMenu(pet) {
             sessionItems.push({ label: "没有会话", enabled: false });
         }
         else {
-            // A session can be bound to exactly one pet. Skip sessions already owned
-            // by another pet so the same session id never appears on two pets.
+            // A session can be bound to exactly one *visible* pet. A hidden pet still
+            // remembers its session so re-showing it keeps the conversation, but it
+            // must not make the session unreachable from the live pet.
             const available = sessions.filter((session) => {
                 const owner = petForSession(session.id);
-                return owner === undefined || owner === pet;
+                return owner === undefined || owner === pet || !petIsVisible(owner);
             });
             if (available.length === 0) {
                 sessionItems.push({ label: "没有可用的会话", enabled: false });
@@ -1615,10 +1711,10 @@ async function showPetContextMenu(pet) {
                     type: "radio",
                     checked: session.id === pet.sessionID,
                     click: () => {
-                        // Re-check at click time: another pet may have claimed this session
-                        // between opening the menu and the click.
+                        // Re-check at click time: another *visible* pet may have claimed
+                        // this session between opening the menu and the click.
                         const owner = petForSession(session.id);
-                        if (owner !== undefined && owner !== pet) {
+                        if (owner !== undefined && owner !== pet && petIsVisible(owner)) {
                             say(pet, "这个会话已被其他宠物占用");
                             publishPanelState(pet);
                             return;
@@ -1677,6 +1773,10 @@ async function showPetContextMenu(pet) {
             click: () => {
                 if (win.isDestroyed())
                     return;
+                // Collapse the chat panel first: hiding the pet alone left the panel
+                // floating over a gone pet, and its blur handler then flipped
+                // `chatExpanded` behind the user's back.
+                setChatExpanded(pet, false);
                 win.hide();
             },
         },
@@ -1738,6 +1838,7 @@ function createPetWindow(options = {}) {
         idleRevertTimer: null,
         chatExpanded: false,
         panelWindow: null,
+        panelReady: undefined,
         wardrobeOutfitId: undefined,
         wardrobeAtlasPath: undefined,
         walkTimer: null,
@@ -1818,8 +1919,14 @@ function createPetWindow(options = {}) {
 function createTray() {
     const icon = nativeImage.createFromPath(trayIconPath);
     tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16, height: 16 }));
-    tray.setToolTip("OpenPets standalone pet");
+    tray.setToolTip(`OpenPets v${app.getVersion()}`);
     tray.setContextMenu(Menu.buildFromTemplate([
+        {
+            label: `OpenPets v${app.getVersion()}`,
+            type: "normal",
+            enabled: false,
+        },
+        { type: "separator" },
         {
             label: "打开宠物管理",
             type: "normal",

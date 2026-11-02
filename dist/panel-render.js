@@ -101,11 +101,36 @@ export function createPanelPageHtml(options = {}) {
   .chat-send-btn:hover { filter: brightness(1.06); }
   .chat-send-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; cursor: not-allowed; }
   .chat-model-line { flex: 0 0 auto; padding: 8px 20px 12px; font-size: 12px; line-height: 17px; color: #64748b; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
-  .chat-update { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 20px; font-size: 12px; line-height: 17px; color: #92400e; background: #fef3c7; white-space: nowrap; overflow: hidden; user-select: none; }
-  .chat-update-text { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .chat-update {
+     display: flex; 
+     flex-direction: row;
+     align-items: center;
+     gap: 8px; padding: 6px 12px; 
+     font-size: 12px; line-height: 17px; 
+     color: #ffffff; background: #2563eb; 
+     white-space: nowrap; overflow: hidden;
+     user-select: none; width: 100%; 
+     box-sizing: border-box; }
+  /* The UA stylesheet's [hidden] { display: none } rule loses to any author
+     display declaration, so the bar's own display: flex kept it on screen
+     even while bar.hidden === true - that is why the empty bar showed up as a
+     lone "更新" button. Force hidden to win on every bar child. */
+  .chat-update[hidden],
+  .chat-update-text[hidden],
+  .chat-update-btn[hidden],
+  .chat-update-test[hidden],
+  .chat-update-skip[hidden] { display: none !important; }
+  /* min-width: 0 lets the flex item actually shrink below its content width;
+     without it the text keeps its intrinsic width and pushes the skip button
+     past the panel's overflow: hidden edge, making it invisible. */
+  .chat-update-text { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .chat-update-btn { flex: 0 0 auto; border: none; border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #fff; background: linear-gradient(135deg, #f59e0b, #d97706); cursor: pointer; }
+  .chat-update-test { flex: 0 0 auto; border: 1px solid #ffffff; border-radius: 999px; padding: 2px 10px; font-size: 12px; color: #ffffff; background: transparent; cursor: pointer; }
+  .chat-update-test:hover { background: rgba(59, 130, 246, 0.12); }
   .chat-update-btn:hover { filter: brightness(1.06); }
   .chat-update-btn:disabled { opacity: 0.55; cursor: default; }
+  .chat-update-skip { flex: 0 0 auto; border: 1px solid #ffffff; border-radius: 999px; padding: 2px 10px; font-size: 12px; color: #ffffff; background: transparent; cursor: pointer; }
+  .chat-update-skip:hover { background: rgba(217, 119, 6, 0.12); }
   @keyframes msg-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 </head>
@@ -121,6 +146,7 @@ export function createPanelPageHtml(options = {}) {
   <div class="chat-update" id="chatUpdate" hidden>
     <span class="chat-update-text" id="chatUpdateText"></span>
     <button type="button" class="chat-update-btn" id="chatUpdateBtn">更新</button>
+    <button type="button" class="chat-update-skip" id="chatUpdateSkip" title="跳过此版本">跳过</button>
   </div>
   <div class="chat-transcript" id="chatTranscript"></div>
   <div class="chat-empty" id="chatEmpty">
@@ -761,14 +787,24 @@ export function createPanelPageHtml(options = {}) {
 
   window.openpetsPanel?.onAsk((ask) => { renderAsk(ask); });
 
-  // Update bar renderer: the main process pushes {version, status} on every
-  // state publish, so the progress text stays live without polling.
+  // Update bar renderer: the main process pushes {version, status, checked}
+  // on every state publish, so the progress text stays live without polling.
   function applyUpdateBar(update) {
     const bar = document.getElementById("chatUpdate");
     const text = document.getElementById("chatUpdateText");
     const button = document.getElementById("chatUpdateBtn");
+    const skip = document.getElementById("chatUpdateSkip");
+    const test = document.getElementById("chatUpdateTest");
+    console.log(bar)
+    console.log(text)
+    console.log(button)
     if (!bar || !text || !button) return;
-    if (!update || typeof update !== "object" || typeof update.version !== "string" || update.version.length === 0) {
+    console.log('in--log')
+    const checked = update !== null && typeof update === "object" && update.checked === true;
+    console.log(checked)
+    const hasVersion = checked && typeof update.version === "string" && update.version.length > 0;
+    console.log(!hasVersion)
+    if (!hasVersion) {
       bar.hidden = true;
       button.disabled = false;
       button.textContent = "更新";
@@ -780,6 +816,20 @@ export function createPanelPageHtml(options = {}) {
     text.textContent = status.length > 0 ? "v" + update.version + " · " + status : "发现新版本 v" + update.version;
     button.disabled = busy;
     button.textContent = busy ? "进行中" : "立即更新";
+    if (skip) {
+      skip.hidden = false;
+      skip.disabled = busy;
+      skip.onclick = () => {
+        bar.hidden = true;
+      };
+    }
+    if (test) {
+      test.hidden = false;
+      test.disabled = busy;
+      test.onclick = () => {
+        bar.hidden = true;
+      };
+    }
     button.onclick = () => {
       if (busy) return;
       button.disabled = true;

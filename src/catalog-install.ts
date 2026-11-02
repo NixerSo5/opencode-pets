@@ -25,7 +25,8 @@ export interface CatalogInstallResult {
   readonly id?: string;
 }
 
-const allowedZipHosts = ["zip.openpets.dev", "openpets.dev"];
+// Gitee hosts the mirrored catalog; openpets.dev remains the fallback source.
+const allowedZipHosts = ["gitee.com", "zip.openpets.dev", "openpets.dev"];
 
 function assertZipUrl(url: string): void {
   const parsed = new URL(url);

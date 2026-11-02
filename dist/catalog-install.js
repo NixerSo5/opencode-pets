@@ -15,7 +15,8 @@ const maxZipBytes = 50 * 1024 * 1024;
 const maxExtractedBytes = 200 * 1024 * 1024;
 const maxExtractedFiles = 500;
 const maxZipEntryBytes = 100 * 1024 * 1024;
-const allowedZipHosts = ["zip.openpets.dev", "openpets.dev"];
+// Gitee hosts the mirrored catalog; openpets.dev remains the fallback source.
+const allowedZipHosts = ["gitee.com", "zip.openpets.dev", "openpets.dev"];
 function assertZipUrl(url) {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:")

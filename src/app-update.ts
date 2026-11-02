@@ -1,13 +1,14 @@
 /**
  * app-update.ts
  *
- * GitHub-release update flow for OpenPets, Gitee-first:
- *  1. `checkForUpdate` reads the latest release from the GitHub API and
- *     compares the tag against the running version.
+ * Gitee-first release update flow for OpenPets:
+ *  1. `checkForUpdate` asks the Gitee mirror for its latest release and
+ *     compares that tag against the running version. Only when Gitee is
+ *     unreachable or has no release does it fall back to the GitHub API.
  *  2. `findGiteeVolumes` looks up the same tag on the Gitee mirror; when the
  *     mirror carries split `.7z.001/.002…` volumes of the installer they are
  *     downloaded first (fast in CN and small attachments respect Gitee's
- *     100 MB per-file limit).
+ *     100 MB per-file limit). Portable installs always use the GitHub asset.
  *  3. `extractVolumes` assembles the installer with the bundled standalone
  *     7-Zip console (vendor/7zr.exe) into a temp dir.
  *  4. When the mirror is unreachable or lacks volumes, `downloadUpdate`
@@ -35,7 +36,77 @@ const repository = "NixerSo5/opencode-pets";
 const giteeOwnerRepo = "nixer/opencode-pets";
 const releaseApiUrl = `https://api.github.com/repos/${repository}/releases/latest`;
 const giteeTagApiUrl = (tag: string) => `https://gitee.com/api/v5/repos/${giteeOwnerRepo}/releases/tags/${tag}`;
+// Gitee is the primary source in CN: its latest release decides the version,
+// and only when Gitee is unreachable / has no release do we ask GitHub.
+const giteeLatestApiUrl = `https://gitee.com/api/v5/repos/${giteeOwnerRepo}/releases/latest`;
 const timeoutMs = 15_000;
+
+/** Raw fields we need from either release API. */
+interface RawRelease {
+  readonly tag_name?: string;
+  readonly html_url?: string;
+  readonly draft?: boolean;
+  readonly prerelease?: boolean;
+  readonly assets?: Array<{ name: string; browser_download_url: string; size: number }>;
+}
+
+/**
+ * Read the latest release from the Gitee mirror.
+ *
+ * Returns `undefined` on every kind of miss (network error, timeout, non-200,
+ * unparsable body) so `checkForUpdate` can fall straight through to GitHub
+ * without special-casing error types.
+ */
+async function fetchGiteeLatestRelease(): Promise<RawRelease | undefined> {
+  try {
+    const response = await fetch(giteeLatestApiUrl, {
+      headers: { "User-Agent": "openpets-release", Accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      console.log(`[update] gitee latest: HTTP ${response.status}`);
+      return undefined;
+    }
+    const release = (await response.json()) as RawRelease | undefined;
+    if (release === undefined || typeof release !== "object") {
+      console.log("[update] gitee latest: empty body");
+      return undefined;
+    }
+    if (release.draft === true || release.prerelease === true) return undefined;
+    console.log(`[update] gitee latest ok: ${release.tag_name ?? "(no tag)"}`);
+    return release;
+  } catch (error) {
+    console.log(`[update] gitee latest failed: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+/** Read the latest release from the GitHub API; undefined on any miss. */
+async function fetchGithubLatestRelease(): Promise<RawRelease | undefined> {
+  try {
+    const response = await fetch(releaseApiUrl, {
+      headers: { "User-Agent": "openpets-release", Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      console.log(`[update] github latest: HTTP ${response.status}`);
+      return undefined;
+    }
+    const release = (await response.json()) as RawRelease;
+    if (release.draft === true || release.prerelease === true) return undefined;
+    console.log(`[update] github latest ok: ${release.tag_name ?? "(no tag)"}`);
+    return release;
+  } catch (error) {
+    console.log(`[update] github latest failed: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+/** Strip the tag prefix and validate, e.g. "v1.4.0" → "1.4.0". */
+function versionFromTag(tag: string | undefined): string | undefined {
+  if (tag === undefined || parseSemver(tag) === undefined) return undefined;
+  return tag.replace(/^v/, "");
+}
 
 export interface UpdateInfo {
   /** Running version ("1.3.2"). */
@@ -121,55 +192,87 @@ function pickAsset(mode: "portable" | "nsis", version: string, assets: Array<{ n
   return undefined;
 }
 
-/** Query the GitHub API; undefined (no error detail) when nothing newer. */
+/**
+ * Resolve a raw release into an `UpdateInfo`, or `undefined` when it is not
+ * newer / has no usable asset. `gitHubFallback` says which source produced
+ * `release`: when it is Gitee we still need the GitHub asset for portable
+ * installs and as the NSIS fallback when the mirror has no volumes.
+ */
+async function resolveRelease(
+  release: RawRelease,
+  current: string,
+  githubFallback: RawRelease | undefined,
+): Promise<UpdateInfo | undefined> {
+  if (release.draft === true || release.prerelease === true) return undefined;
+  const latest = versionFromTag(release.tag_name);
+  if (latest === undefined) {
+    console.log(`[update] check skipped: unparsable tag ${release.tag_name ?? "(none)"}`);
+    return undefined;
+  }
+  if (!isNewerVersion(latest, current)) return undefined;
+  const mode = isPortableInstall() ? "portable" : "nsis";
+  const assets = release.assets ?? [];
+  // The Gitee mirror only carries split NSIS volumes; portable installs and
+  // the NSIS fallback always come from GitHub, so look there for those.
+  const githubAssets = githubFallback?.assets ?? assets;
+  const asset = mode === "portable"
+    ? pickAsset("portable", latest, githubAssets) ?? pickAsset("portable", latest, assets)
+    : pickAsset("nsis", latest, assets) ?? pickAsset("nsis", latest, githubAssets);
+  if (asset === undefined) {
+    console.log(`[update] release ${latest} has no asset for mode=${mode}`);
+    return undefined;
+  }
+  // Prefer the Gitee mirror (CN-fast, fits the 100 MB attachment limit via
+  // split volumes); undefined when the mirror has no release for this tag,
+  // which sends the download to the GitHub asset directly.
+  const giteeVolumes = mode === "nsis" ? await findGiteeVolumes(latest) : undefined;
+  if (mode === "nsis" && giteeVolumes === undefined) {
+    console.log("[update] gitee mirror unavailable or volume-less; will fall back to github");
+  }
+  console.log(`[update] available: ${current} -> ${latest} (${asset.name})`);
+  return {
+    current,
+    latest,
+    releaseUrl: release.html_url ?? githubFallback?.html_url ?? "",
+    assetUrl: asset.url,
+    assetName: asset.name,
+    assetSize: asset.size,
+    giteeVolumes,
+  };
+}
+
+/**
+ * Check for a newer release, Gitee first.
+ *
+ * The Gitee mirror is the primary source in CN; when it is unreachable or has
+ * no published release we ask GitHub. Portable installs always need the
+ * GitHub asset, so a Gitee hit still fetches the GitHub release as a fallback.
+ */
 export async function checkForUpdate(current: string): Promise<UpdateInfo | undefined> {
   try {
-    const response = await fetch(releaseApiUrl, {
-      headers: { "User-Agent": "openpets-release", Accept: "application/vnd.github+json" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) {
-      console.log(`[update] check skipped: HTTP ${response.status}`);
+    const giteeRelease = await fetchGiteeLatestRelease();
+    if (giteeRelease !== undefined) {
+      const giteeVersion = versionFromTag(giteeRelease.tag_name);
+      if (giteeVersion !== undefined && isNewerVersion(giteeVersion, current)) {
+        // A newer version exists on the mirror. Portable installs and the
+        // NSIS fallback need GitHub's asset list, so fetch it once here; a
+        // GitHub miss still leaves the Gitee volumes usable for NSIS.
+        const mode = isPortableInstall() ? "portable" : "nsis";
+        const githubRelease = mode === "nsis" ? undefined : await fetchGithubLatestRelease();
+        const resolved = await resolveRelease(giteeRelease, current, githubRelease);
+        if (resolved !== undefined) return resolved;
+      } else if (giteeVersion === undefined) {
+        console.log(`[update] gitee tag unparsable: ${giteeRelease.tag_name ?? "(none)"}; falling back to github`);
+      }
+    }
+    // Gitee unreachable, has no release, or carries nothing newer: use the
+    // GitHub latest release for the version and asset.
+    const githubRelease = await fetchGithubLatestRelease();
+    if (githubRelease === undefined) {
+      console.log("[update] no release available on gitee or github");
       return undefined;
     }
-    const release = (await response.json()) as {
-      tag_name?: string;
-      html_url?: string;
-      draft?: boolean;
-      prerelease?: boolean;
-      assets?: Array<{ name: string; browser_download_url: string; size: number }>;
-    };
-    if (release.draft === true || release.prerelease === true) return undefined;
-    const latest = parseSemver(release.tag_name ?? "") === undefined ? undefined : (release.tag_name ?? "").replace(/^v/, "");
-    if (latest === undefined) {
-      console.log(`[update] check skipped: unparsable tag ${release.tag_name ?? "(none)"}`);
-      return undefined;
-    }
-    if (!isNewerVersion(latest, current)) return undefined;
-    const mode = isPortableInstall() ? "portable" : "nsis";
-    const assets = release.assets ?? [];
-    const asset = pickAsset(mode, latest, assets) ?? (mode === "nsis" ? undefined : pickAsset("nsis", latest, assets));
-    if (asset === undefined) {
-      console.log(`[update] release ${latest} has no asset for mode=${mode}`);
-      return undefined;
-    }
-    // Prefer the Gitee mirror (CN-fast, fits the 100 MB attachment limit via
-    // split volumes); undefined when the mirror has no release for this tag,
-    // which sends the download to the GitHub asset directly.
-    const giteeVolumes = mode === "nsis" ? await findGiteeVolumes(latest) : undefined;
-    if (mode === "nsis" && giteeVolumes === undefined) {
-      console.log("[update] gitee mirror unavailable or volume-less; will fall back to github");
-    }
-    console.log(`[update] available: ${current} -> ${latest} (${asset.name})`);
-    return {
-      current,
-      latest,
-      releaseUrl: release.html_url ?? "",
-      assetUrl: asset.url,
-      assetName: asset.name,
-      assetSize: asset.size,
-      giteeVolumes,
-    };
+    return await resolveRelease(githubRelease, current, undefined);
   } catch (error) {
     console.log(`[update] check failed: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;

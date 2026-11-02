@@ -5,7 +5,13 @@
  * catalog v3 contract: index → filtered pages (pageSize 100) → flat search
  * list, with category / original / featured filters.
  */
-const catalogV3Url = "https://openpets.dev/pets/catalog.v3.json";
+// The marketplace index is mirrored into a Gitee repo so CN users don't depend
+// on openpets.dev; the upstream URL stays as a fallback for when the mirror is
+// unreachable or stale.
+const catalogV3Urls = [
+    "https://gitee.com/nixer/pets-shop-copy/raw/master/pets/catalog.v3.json",
+    "https://openpets.dev/pets/catalog.v3.json",
+];
 export const emptyCatalogFilters = { categories: [] };
 let indexCache;
 async function fetchJson(url) {
@@ -14,9 +20,22 @@ async function fetchJson(url) {
         throw new Error(`HTTP ${response.status} for ${url}`);
     return await response.json();
 }
+/** First source that answers wins; the rest are fallbacks. */
+async function fetchFirstJson(urls) {
+    let lastError;
+    for (const url of urls) {
+        try {
+            return await fetchJson(url);
+        }
+        catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error("catalog index unreachable");
+}
 async function getCatalogIndex() {
     indexCache ??= (async () => {
-        const raw = await fetchJson(catalogV3Url);
+        const raw = await fetchFirstJson(catalogV3Urls);
         const pageUrls = Array.isArray(raw.pages) ? raw.pages.filter((entry) => typeof entry === "string") : [];
         if (pageUrls.length === 0)
             throw new Error("catalog index has no pages");
