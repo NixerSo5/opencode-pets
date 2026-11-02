@@ -6,7 +6,7 @@
  * only that tab) in a normal management window.
  */
 import { app, BrowserWindow, Tray, Menu, screen, ipcMain, nativeImage, dialog, clipboard, Notification } from "electron";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
@@ -521,6 +521,10 @@ function ensurePanelWindow(pet) {
         if (!panelHasFocused)
             return;
         if (!pet.chatExpanded)
+            return;
+        // The native file dialog is a separate window: the focus it takes is not a
+        // click-away, and closing the panel there would also kill the dialog.
+        if (panelDialogOwners.has(panel.webContents.id))
             return;
         if (Date.now() - panelShownAt < BLUR_GRACE_MS)
             return;
@@ -1157,12 +1161,63 @@ const HTTP_TURN_TIMEOUT_MS = 600_000;
  * never carries a model — the session's own model is the single source of
  * truth, so the pet cannot implicitly override model selection.
  */
-async function runHttpTurn(endpoint, sessionID, text) {
+const maxChatImages = 4;
+const maxChatImageBytes = 5 * 1024 * 1024;
+const maxChatImagesTotalBytes = 12 * 1024 * 1024;
+// Panels whose native file dialog is open right now. The dialog steals focus
+// from the panel, so the click-away blur handler must ignore those blurs.
+const panelDialogOwners = new Set();
+// The panel can only produce data URLs; anything else (file://, http://) would
+// let a compromised renderer hand the agent an arbitrary local file.
+const chatImagePattern = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+/** Extension -> MIME for the picker; anything else is refused. */
+function chatImageMimeForPath(filePath) {
+    const lower = filePath.toLowerCase();
+    if (lower.endsWith(".png"))
+        return "image/png";
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg"))
+        return "image/jpeg";
+    if (lower.endsWith(".webp"))
+        return "image/webp";
+    if (lower.endsWith(".gif"))
+        return "image/gif";
+    return undefined;
+}
+/** Validate the images a panel wants to attach to one prompt. */
+function sanitizeChatImages(raw) {
+    if (raw === undefined || raw === null)
+        return { ok: true, images: [] };
+    if (!Array.isArray(raw))
+        return { ok: false, error: "图片参数格式不正确" };
+    if (raw.length > maxChatImages)
+        return { ok: false, error: `最多附加 ${maxChatImages} 张图片` };
+    const images = [];
+    let totalBytes = 0;
+    for (const item of raw) {
+        if (typeof item !== "object" || item === null)
+            return { ok: false, error: "图片参数格式不正确" };
+        const record = item;
+        const uri = typeof record.uri === "string" ? record.uri : "";
+        if (!chatImagePattern.test(uri))
+            return { ok: false, error: "只支持 PNG / JPEG / WebP / GIF 图片" };
+        const base64 = uri.slice(uri.indexOf(",") + 1);
+        const bytes = Math.floor((base64.length * 3) / 4);
+        if (bytes > maxChatImageBytes)
+            return { ok: false, error: "单张图片不能超过 5 MB" };
+        totalBytes += bytes;
+        if (totalBytes > maxChatImagesTotalBytes)
+            return { ok: false, error: "图片总大小不能超过 12 MB" };
+        const name = typeof record.name === "string" ? record.name.trim().slice(0, 120) : "";
+        images.push(name.length > 0 ? { uri, name } : { uri });
+    }
+    return { ok: true, images };
+}
+async function runHttpTurn(endpoint, sessionID, text, attachments) {
     // Small slack: the server timestamps the user message, so a turn "starts" a
     // moment before the POST resolves.
     const startedAt = Date.now() - 2_000;
     try {
-        await sendPrompt(endpoint, sessionID, text);
+        await sendPrompt(endpoint, sessionID, text, attachments);
     }
     catch (error) {
         return { kind: "send-failed", error: error instanceof Error ? error.message : String(error) };
@@ -2113,9 +2168,69 @@ function installIpc() {
             return { ok: true, label: "默认模型（会话未指定）" };
         return { ok: true, label: `${model.providerID}/${model.id}` };
     });
+    // Native image picker for the chat composer. It lives in the main process
+    // (not an <input type=file>) so the panel's blur handler can keep the panel
+    // alive while the dialog owns focus.
+    ipcMain.handle("openpets:panel-pick-images", async (event) => {
+        const pet = petForPanelSender(event.sender);
+        const panel = pet?.panelWindow ?? BrowserWindow.fromWebContents(event.sender);
+        if (panel === null || panel === undefined || panel.isDestroyed())
+            return { ok: false, error: "对话窗口已关闭", images: [] };
+        const ownerId = panel.webContents.id;
+        panelDialogOwners.add(ownerId);
+        try {
+            const result = await dialog.showOpenDialog(panel, {
+                title: "选择图片",
+                buttonLabel: "添加",
+                properties: ["openFile", "multiSelections"],
+                filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
+            });
+            if (result.canceled || result.filePaths.length === 0)
+                return { ok: true, images: [] };
+            const images = [];
+            let totalBytes = 0;
+            for (const filePath of result.filePaths) {
+                if (images.length >= maxChatImages) {
+                    return { ok: false, error: `最多附加 ${maxChatImages} 张图片`, images: [] };
+                }
+                const mime = chatImageMimeForPath(filePath);
+                if (mime === undefined)
+                    continue;
+                const bytes = await readFile(filePath).catch(() => undefined);
+                if (bytes === undefined)
+                    continue;
+                if (bytes.length > maxChatImageBytes) {
+                    return { ok: false, error: `图片太大（上限 5 MB）：${basename(filePath)}`, images: [] };
+                }
+                totalBytes += bytes.length;
+                if (totalBytes > maxChatImagesTotalBytes)
+                    return { ok: false, error: "图片总大小不能超过 12 MB", images: [] };
+                images.push({ uri: `data:${mime};base64,${bytes.toString("base64")}`, name: basename(filePath) });
+            }
+            return { ok: true, images };
+        }
+        catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error), images: [] };
+        }
+        finally {
+            panelDialogOwners.delete(ownerId);
+            // The dialog took focus; hand it back so the composer stays usable.
+            if (!panel.isDestroyed())
+                panel.focus();
+        }
+    });
     ipcMain.handle("openpets:pet-chat-send", async (event, raw) => {
-        const text = typeof raw === "string" ? raw.trim() : "";
-        if (!text)
+        // The panel sends `{ text, images }`; a bare string stays supported so an
+        // older cached panel HTML keeps working.
+        const payload = typeof raw === "string"
+            ? { text: raw, images: undefined }
+            : (typeof raw === "object" && raw !== null ? raw : { text: undefined, images: undefined });
+        const text = typeof payload.text === "string" ? payload.text.trim() : "";
+        const sanitized = sanitizeChatImages(payload.images);
+        if (!sanitized.ok)
+            return { ok: false, error: sanitized.error };
+        const images = sanitized.images;
+        if (!text && images.length === 0)
             return { ok: false, error: "消息为空" };
         if (text.length > 4000)
             return { ok: false, error: "消息太长（上限 4000 字）" };
@@ -2140,10 +2255,14 @@ function installIpc() {
         // turn, so the pet cannot implicitly override model selection — and a
         // `question` form keeps the loop genuinely parked until the panel replies.
         if (pet.endpoint !== undefined) {
-            const http = await runHttpTurn(pet.endpoint, sessionID, text);
+            const http = await runHttpTurn(pet.endpoint, sessionID, text, images);
             if (http.kind === "done")
                 return http.result;
             console.log(`[opencode-http] send failed, falling back to CLI: ${http.error}`);
+            // The CLI fallback cannot carry inline images, so a failed HTTP send is
+            // terminal for an image prompt instead of silently dropping the files.
+            if (images.length > 0)
+                return { ok: false, error: `图片只能通过 HTTP 通道发送：${http.error}` };
         }
         // Fallback: run the turn through the real CLI, exactly like the user does
         // in a terminal. Prompt delivery failed over HTTP, so mirror the session's

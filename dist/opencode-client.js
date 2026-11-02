@@ -143,10 +143,19 @@ export async function activeSessions(endpoint) {
     return body.data ?? {};
 }
 /** Admit one user prompt; the agent loop starts unless `resume` is false. */
-export async function sendPrompt(endpoint, sessionID, prompt) {
+export async function sendPrompt(endpoint, sessionID, prompt, attachments) {
+    // `files` is the server's PromptInput.FileAttachment[]: only `uri` is
+    // required, `name` gives the model a human label for the image.
+    const payload = { text: prompt };
+    if (attachments !== undefined && attachments.length > 0) {
+        payload.files = attachments.map((file) => ({
+            uri: file.uri,
+            ...(file.name === undefined ? {} : { name: file.name }),
+        }));
+    }
     await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/prompt`, {
         method: "POST",
-        body: JSON.stringify({ text: prompt }),
+        body: JSON.stringify(payload),
     });
 }
 /** Permissions the session is currently blocked on (empty when none). */
@@ -546,6 +555,28 @@ export function toolSummary(name, input) {
  * The projection returns newest first; the chat panel renders oldest first,
  * so the flattened rows are reversed here once.
  */
+/**
+ * Data URLs for the images a projected user message carried.
+ *
+ * The projection normally hands back `{ data, mime }` (base64 without the
+ * `data:` prefix); a prompt we sent ourselves may still be echoed as `uri`.
+ */
+function promptImageUrls(files) {
+    if (!Array.isArray(files))
+        return [];
+    const urls = [];
+    for (const file of files) {
+        const uri = typeof file.uri === "string" ? file.uri : "";
+        if (uri.startsWith("data:image/")) {
+            urls.push(uri);
+            continue;
+        }
+        if (typeof file.data === "string" && typeof file.mime === "string" && file.mime.startsWith("image/")) {
+            urls.push(`data:${file.mime};base64,${file.data}`);
+        }
+    }
+    return urls;
+}
 export async function readTimeline(endpoint, sessionID) {
     const body = await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/message`);
     const rows = [];
@@ -563,13 +594,24 @@ export async function readTimeline(endpoint, sessionID) {
         if (role !== "user" && role !== "assistant")
             continue;
         const blocks = message.content ?? message.parts ?? [];
+        const images = promptImageUrls(message.files);
         if (blocks.length === 0) {
-            // User prompts live on the message itself, not in content.
+            // User prompts live on the message itself, not in content. Text and
+            // images share one row so the panel renders them as a single bubble.
             const text = typeof message.text === "string" ? message.text.trim() : "";
-            if (text.length > 0)
-                rows.push({ id: message.id, role, text, time: message.time?.created, kind: "chat" });
-            else if (error !== undefined)
+            if (text.length > 0 || images.length > 0) {
+                rows.push({
+                    id: message.id,
+                    role,
+                    text,
+                    time: message.time?.created,
+                    kind: text.length > 0 ? "chat" : "image",
+                    images: images.length > 0 ? images : undefined,
+                });
+            }
+            else if (error !== undefined) {
                 rows.push({ id: message.id, role, text: "", time: message.time?.created, error, kind: "error" });
+            }
             continue;
         }
         blocks.forEach((block, index) => {

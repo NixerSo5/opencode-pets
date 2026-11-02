@@ -13,7 +13,7 @@ export function createPanelPageHtml(options = {}) {
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src file: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
 <title>OpenPets chat</title>
 <style>
   html, body { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
@@ -92,6 +92,19 @@ export function createPanelPageHtml(options = {}) {
   .chat-ask-submit { flex: 1 1 auto; padding: 8px 14px; border: none; border-radius: 10px; background: linear-gradient(135deg, #6366f1, #4f46e5); color: #fff; font: 700 12px/16px "Segoe UI", ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
   .chat-ask-submit:hover { filter: brightness(1.06); }
   .chat-composer { flex: 0 0 auto; display: flex; align-items: flex-end; gap: 8px; padding: 12px 14px; border-top: 1px solid rgba(226, 232, 240, 0.9); background: rgba(248, 250, 252, 0.75); }
+  /* Attachments: thumbnails sit above the composer, images inside a bubble sit
+     above its text. Both use object-fit so a tall screenshot stays readable. */
+  .chat-attach-strip { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 14px 0; background: rgba(248, 250, 252, 0.75); }
+  .chat-attach-item { position: relative; width: 56px; height: 56px; border-radius: 10px; overflow: hidden; border: 1px solid rgba(203, 213, 225, 0.95); background: #fff; }
+  .chat-attach-item img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .chat-attach-remove { position: absolute; top: 2px; right: 2px; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; padding: 0; border: none; border-radius: 999px; background: rgba(15, 23, 42, 0.62); color: #fff; font-size: 11px; line-height: 1; cursor: pointer; }
+  .chat-attach-remove:hover { background: rgba(185, 28, 28, 0.9); }
+  .chat-attach-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: 1px solid rgba(203, 213, 225, 0.95); border-radius: 12px; background: #fff; color: #475569; cursor: pointer; }
+  .chat-attach-btn:hover { border-color: #93c5fd; color: #2563eb; }
+  .chat-msg-images { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chat-msg-images img { display: block; max-width: 168px; max-height: 168px; border-radius: 10px; object-fit: cover; }
+  .chat-msg.is-user .chat-msg-images img { border: 1px solid rgba(255, 255, 255, 0.45); }
+  .chat-msg.is-assistant .chat-msg-images img { border: 1px solid rgba(226, 232, 240, 0.9); }
   .chat-textarea { flex: 1 1 auto; box-sizing: border-box; min-height: 36px; max-height: 120px; padding: 8px 12px; border-radius: 12px; border: 1px solid rgba(203, 213, 225, 0.95); background: #fff; color: #0f172a; font: 400 13px/19px "Segoe UI", ui-sans-serif, system-ui, sans-serif; resize: none; }
   .chat-textarea:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.13); }
   .chat-stop-btn, .chat-send-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; border-radius: 12px; color: #fff; cursor: pointer; }
@@ -155,7 +168,11 @@ export function createPanelPageHtml(options = {}) {
     <div class="chat-empty-subtitle">这里是「${petNameDisplay}」的对话窗口。</div>
   </div>
   <div class="chat-ask" id="chatAsk" hidden></div>
+  <div class="chat-attach-strip" id="chatAttachStrip" hidden></div>
   <div class="chat-composer">
+    <button type="button" class="chat-attach-btn" id="chatAttach" title="添加图片（也可粘贴或拖入）" aria-label="添加图片">
+      <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+    </button>
     <textarea class="chat-textarea" id="chatText" rows="1" maxlength="2000" placeholder="输入消息…（Enter 发送）"></textarea>
     <button type="button" class="chat-stop-btn" id="chatStop" title="停止思考" aria-label="停止思考" hidden>
       <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5" fill="currentColor"/></svg>
@@ -212,10 +229,94 @@ export function createPanelPageHtml(options = {}) {
   const chatStopBtn = document.getElementById("chatStop");
   const chatModelLine = document.getElementById("chatModelLine");
   const chatAsk = document.getElementById("chatAsk");
+  const chatAttachBtn = document.getElementById("chatAttach");
+  const chatAttachStrip = document.getElementById("chatAttachStrip");
+
+  // Attachments are held as data URLs so one IPC hop carries everything: the
+  // main process re-validates the MIME type and size before admitting them.
+  const MAX_ATTACHMENTS = 4;
+  const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+  const allowedImageTypes = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+  let pendingImages = [];
+
+  function createImageGrid(urls) {
+    const grid = document.createElement("div");
+    grid.className = "chat-msg-images";
+    for (const url of urls) {
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = "图片";
+      img.draggable = false;
+      grid.appendChild(img);
+    }
+    return grid;
+  }
+
+  function renderAttachStrip() {
+    chatAttachStrip.innerHTML = "";
+    chatAttachStrip.hidden = pendingImages.length === 0;
+    pendingImages.forEach((image, index) => {
+      const item = document.createElement("div");
+      item.className = "chat-attach-item";
+      const img = document.createElement("img");
+      img.src = image.uri;
+      img.alt = image.name || "图片";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chat-attach-remove";
+      remove.title = "移除";
+      remove.setAttribute("aria-label", "移除这张图片");
+      remove.textContent = "✕";
+      remove.addEventListener("click", () => {
+        pendingImages.splice(index, 1);
+        renderAttachStrip();
+      });
+      item.appendChild(img);
+      item.appendChild(remove);
+      chatAttachStrip.appendChild(item);
+    });
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.onerror = () => reject(reader.error || new Error("读取失败"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function attachImageFiles(fileList) {
+    const files = Array.from(fileList || []).filter((file) => allowedImageTypes.indexOf(file.type) >= 0);
+    if (files.length === 0) return;
+    for (const file of files) {
+      if (pendingImages.length >= MAX_ATTACHMENTS) {
+        addChatMessage("assistant", "最多附加 " + MAX_ATTACHMENTS + " 张图片");
+        break;
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        addChatMessage("assistant", "图片太大（上限 5 MB）：" + file.name);
+        continue;
+      }
+      try {
+        const uri = await readFileAsDataUrl(file);
+        if (uri.length === 0) continue;
+        pendingImages.push({ uri, name: file.name });
+      } catch {
+        addChatMessage("assistant", "读取图片失败：" + file.name);
+      }
+    }
+    renderAttachStrip();
+  }
+
+  function clearPendingImages() {
+    pendingImages = [];
+    renderAttachStrip();
+  }
 
   const renderedMessageIds = new Set();
 
-  function addChatMessage(role, text, id) {
+  function addChatMessage(role, text, id, images) {
     if (id !== undefined) {
       if (renderedMessageIds.has(id)) return;
       renderedMessageIds.add(id);
@@ -226,10 +327,17 @@ export function createPanelPageHtml(options = {}) {
     wrap.className = "chat-msg is-" + role;
     const bubbleEl = document.createElement("div");
     bubbleEl.className = "chat-msg-bubble";
-    if (role === "assistant") bubbleEl.innerHTML = renderMarkdown(text);
-    else bubbleEl.textContent = text;
+    const imageUrls = Array.isArray(images) ? images.filter((uri) => typeof uri === "string" && uri.length > 0) : [];
+    if (imageUrls.length > 0) bubbleEl.appendChild(createImageGrid(imageUrls));
+    const body = typeof text === "string" ? text : "";
+    if (body.length > 0) {
+      const bodyEl = document.createElement("div");
+      if (role === "assistant") bodyEl.innerHTML = renderMarkdown(body);
+      else bodyEl.textContent = body;
+      bubbleEl.appendChild(bodyEl);
+    }
     wrap.appendChild(bubbleEl);
-    wrap.appendChild(createCopyButton("chat-copy-btn chat-msg-copy", () => text));
+    if (body.length > 0) wrap.appendChild(createCopyButton("chat-copy-btn chat-msg-copy", () => body));
     chatTranscript.appendChild(wrap);
     chatTranscript.scrollTop = chatTranscript.scrollHeight;
     return wrap;
@@ -250,13 +358,19 @@ export function createPanelPageHtml(options = {}) {
    * (or turned red when it failed). Returns the element so the caller can
    * settle it.
    */
-  function addPendingMessage(text) {
+  function addPendingMessage(text, images) {
     chatEmpty.style.display = "none";
     const wrap = document.createElement("div");
     wrap.className = "chat-msg is-user is-pending";
     const bubbleEl = document.createElement("div");
     bubbleEl.className = "chat-msg-bubble";
-    bubbleEl.textContent = text;
+    const imageUrls = Array.isArray(images) ? images.map((image) => image && image.uri).filter((uri) => typeof uri === "string" && uri.length > 0) : [];
+    if (imageUrls.length > 0) bubbleEl.appendChild(createImageGrid(imageUrls));
+    if (typeof text === "string" && text.length > 0) {
+      const bodyEl = document.createElement("div");
+      bodyEl.textContent = text;
+      bubbleEl.appendChild(bodyEl);
+    }
     wrap.appendChild(bubbleEl);
     chatTranscript.appendChild(wrap);
     chatTranscript.scrollTop = chatTranscript.scrollHeight;
@@ -512,18 +626,26 @@ export function createPanelPageHtml(options = {}) {
         }
       };
       for (const entry of messages) {
+        const imageUrls = Array.isArray(entry?.images) ? entry.images.filter((uri) => typeof uri === "string" && uri.length > 0) : [];
+        // Image-only prompts carry no text at all.
+        if (entry && entry.kind === "image") {
+          if (imageUrls.length === 0) continue;
+          flushAsksBefore(entry.time);
+          addChatMessage(entry.role, "", entry.id, imageUrls);
+          continue;
+        }
         if (typeof entry?.text !== "string") continue;
         if (entry.kind === "tool") {
           flushAsksBefore(entry.time);
           addProcessRow(entry);
           continue;
         }
-        if (entry.text.trim().length === 0) continue;
+        if (entry.text.trim().length === 0 && imageUrls.length === 0) continue;
         // The answer text we ourselves sent after an ask card is already shown
         // as a card; rendering it again would duplicate the question.
         if (entry.role === "user" && entry.text.startsWith("回答你的问题：")) continue;
         flushAsksBefore(entry.time);
-        if (entry.role === "user" || entry.role === "assistant") addChatMessage(entry.role, entry.text, entry.id);
+        if (entry.role === "user" || entry.role === "assistant") addChatMessage(entry.role, entry.text, entry.id, imageUrls);
       }
       while (cursor < pending.length) {
         appendAskCard(pending[cursor]);
@@ -558,11 +680,17 @@ export function createPanelPageHtml(options = {}) {
 
   async function sendCurrentText(explicit) {
     const text = (typeof explicit === "string" ? explicit : chatText.value).trim();
-    if (!text) return;
-    if (typeof explicit !== "string") chatText.value = "";
+    const images = pendingImages.slice();
+    // An image-only message is valid: the model sees the attachment and an
+    // empty caption.
+    if (!text && images.length === 0) return;
+    if (typeof explicit !== "string") {
+      chatText.value = "";
+      clearPendingImages();
+    }
     // Queue it right away so the user sees the message was accepted, then let
     // drainSendQueue settle the bubble once the turn actually goes out.
-    sendQueue.push({ text, el: addPendingMessage(text) });
+    sendQueue.push({ text, images, el: addPendingMessage(text, images) });
     void drainSendQueue();
   }
 
@@ -590,7 +718,7 @@ export function createPanelPageHtml(options = {}) {
           settlePending(item, "failed");
           throw new Error("preload 未暴露 chatSend");
         }
-        const result = await window.openpetsPanel.chatSend(item.text);
+        const result = await window.openpetsPanel.chatSend(item.text, item.images);
         if (result && result.ok) {
           settlePending(item, "sent");
           if (result.reply) addChatMessage("assistant", result.reply);
@@ -637,6 +765,67 @@ export function createPanelPageHtml(options = {}) {
       event.preventDefault();
       void sendCurrentText();
     }
+  });
+
+  // The picker runs in the main process: an <input type=file> would blur the
+  // panel and the click-away handler would destroy it mid-dialog.
+  async function pickImages() {
+    if (!window.openpetsPanel || typeof window.openpetsPanel.pickImages !== "function") {
+      addChatMessage("assistant", "当前窗口不支持选择图片");
+      return;
+    }
+    chatAttachBtn.disabled = true;
+    try {
+      const result = await window.openpetsPanel.pickImages();
+      if (!result || result.ok === false) {
+        if (result && result.error) addChatMessage("assistant", result.error);
+        return;
+      }
+      for (const image of result.images || []) {
+        if (pendingImages.length >= MAX_ATTACHMENTS) {
+          addChatMessage("assistant", "最多附加 " + MAX_ATTACHMENTS + " 张图片");
+          break;
+        }
+        if (image && typeof image.uri === "string" && image.uri.length > 0) {
+          pendingImages.push({ uri: image.uri, name: typeof image.name === "string" ? image.name : "" });
+        }
+      }
+      renderAttachStrip();
+    } catch (error) {
+      addChatMessage("assistant", "选择图片失败：" + (error && error.message ? error.message : error));
+    } finally {
+      chatAttachBtn.disabled = false;
+      chatText.focus();
+    }
+  }
+
+  chatAttachBtn.addEventListener("click", () => { void pickImages(); });
+  // Screenshots usually arrive via the clipboard: paste them straight in.
+  chatText.addEventListener("paste", (event) => {
+    const items = event.clipboardData && event.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      if (item.kind === "file" && item.type.indexOf("image/") === 0) {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length === 0) return;
+    event.preventDefault();
+    void attachImageFiles(files);
+  });
+  // Dropping a file on a file:// page would navigate away, so swallow it.
+  document.addEventListener("dragover", (event) => {
+    const types = event.dataTransfer && event.dataTransfer.types;
+    if (types && Array.prototype.indexOf.call(types, "Files") >= 0) event.preventDefault();
+  });
+  document.addEventListener("drop", (event) => {
+    const files = event.dataTransfer && event.dataTransfer.files;
+    if (!files || files.length === 0) return;
+    event.preventDefault();
+    void attachImageFiles(files);
   });
 
   document.getElementById("chatClose").addEventListener("click", () => {

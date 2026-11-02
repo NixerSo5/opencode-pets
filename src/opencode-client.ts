@@ -185,11 +185,32 @@ export async function activeSessions(endpoint: ServiceEndpoint): Promise<Record<
   return body.data ?? {};
 }
 
+/** One inline attachment admitted with a prompt (images are sent as data URLs). */
+export interface PromptAttachment {
+  /** `data:image/png;base64,...`; the server parses it into an inline file part. */
+  readonly uri: string;
+  readonly name?: string;
+}
+
 /** Admit one user prompt; the agent loop starts unless `resume` is false. */
-export async function sendPrompt(endpoint: ServiceEndpoint, sessionID: string, prompt: string): Promise<void> {
+export async function sendPrompt(
+  endpoint: ServiceEndpoint,
+  sessionID: string,
+  prompt: string,
+  attachments?: readonly PromptAttachment[],
+): Promise<void> {
+  // `files` is the server's PromptInput.FileAttachment[]: only `uri` is
+  // required, `name` gives the model a human label for the image.
+  const payload: Record<string, unknown> = { text: prompt };
+  if (attachments !== undefined && attachments.length > 0) {
+    payload.files = attachments.map((file) => ({
+      uri: file.uri,
+      ...(file.name === undefined ? {} : { name: file.name }),
+    }));
+  }
   await request(endpoint, `/api/session/${encodeURIComponent(sessionID)}/prompt`, {
     method: "POST",
-    body: JSON.stringify({ text: prompt }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -614,9 +635,11 @@ export interface TimelineEntry {
   /**
    * Rendering hint. `chat` is a normal user/assistant bubble; `tool` is an
    * intermediate process row (the CLI equivalent of "→ shell ..."); `error`
-   * is a failed turn.
+   * is a failed turn; `image` is one or more inline images a prompt carried.
    */
-  readonly kind?: "chat" | "tool" | "error";
+  readonly kind?: "chat" | "tool" | "error" | "image";
+  /** Data URLs for `kind: "image"` rows. */
+  readonly images?: readonly string[];
   /** Tool name for `kind: "tool"` rows. */
   readonly tool?: string;
   /** Tool call status (`running` / `completed` / `error`) for tool rows. */
@@ -646,6 +669,11 @@ type RawMessage = {
   error?: { message?: string };
   /** Auto-retry state: the error lives under `retry.error`, not `error`. */
   retry?: { attempt?: number; error?: { message?: string; status?: number } };
+  /**
+   * Inline attachments a user prompt carried. The projection normalises them
+   * to base64 + mime; older rows may still carry the original `uri`.
+   */
+  files?: Array<{ uri?: string; data?: string; mime?: string; name?: string }>;
 };
 
 function describeError(message: RawMessage): string | undefined {
@@ -693,6 +721,28 @@ export function toolSummary(name: string, input: Record<string, unknown> | undef
  * The projection returns newest first; the chat panel renders oldest first,
  * so the flattened rows are reversed here once.
  */
+/**
+ * Data URLs for the images a projected user message carried.
+ *
+ * The projection normally hands back `{ data, mime }` (base64 without the
+ * `data:` prefix); a prompt we sent ourselves may still be echoed as `uri`.
+ */
+function promptImageUrls(files: RawMessage["files"]): string[] {
+  if (!Array.isArray(files)) return [];
+  const urls: string[] = [];
+  for (const file of files) {
+    const uri = typeof file.uri === "string" ? file.uri : "";
+    if (uri.startsWith("data:image/")) {
+      urls.push(uri);
+      continue;
+    }
+    if (typeof file.data === "string" && typeof file.mime === "string" && file.mime.startsWith("image/")) {
+      urls.push(`data:${file.mime};base64,${file.data}`);
+    }
+  }
+  return urls;
+}
+
 export async function readTimeline(endpoint: ServiceEndpoint, sessionID: string): Promise<TimelineEntry[]> {
   const body = await request<{ data: RawMessage[] }>(endpoint, `/api/session/${encodeURIComponent(sessionID)}/message`);
   const rows: TimelineEntry[] = [];
@@ -708,11 +758,23 @@ export async function readTimeline(endpoint: ServiceEndpoint, sessionID: string)
     }
     if (role !== "user" && role !== "assistant") continue;
     const blocks = message.content ?? message.parts ?? [];
+    const images = promptImageUrls(message.files);
     if (blocks.length === 0) {
-      // User prompts live on the message itself, not in content.
+      // User prompts live on the message itself, not in content. Text and
+      // images share one row so the panel renders them as a single bubble.
       const text = typeof message.text === "string" ? message.text.trim() : "";
-      if (text.length > 0) rows.push({ id: message.id, role, text, time: message.time?.created, kind: "chat" });
-      else if (error !== undefined) rows.push({ id: message.id, role, text: "", time: message.time?.created, error, kind: "error" });
+      if (text.length > 0 || images.length > 0) {
+        rows.push({
+          id: message.id,
+          role,
+          text,
+          time: message.time?.created,
+          kind: text.length > 0 ? "chat" : "image",
+          images: images.length > 0 ? images : undefined,
+        });
+      } else if (error !== undefined) {
+        rows.push({ id: message.id, role, text: "", time: message.time?.created, error, kind: "error" });
+      }
       continue;
     }
     blocks.forEach((block, index) => {

@@ -99,8 +99,14 @@ export declare function setSessionModel(endpoint: ServiceEndpoint, sessionID: st
 export declare function activeSessions(endpoint: ServiceEndpoint): Promise<Record<string, {
     type: string;
 }>>;
+/** One inline attachment admitted with a prompt (images are sent as data URLs). */
+export interface PromptAttachment {
+    /** `data:image/png;base64,...`; the server parses it into an inline file part. */
+    readonly uri: string;
+    readonly name?: string;
+}
 /** Admit one user prompt; the agent loop starts unless `resume` is false. */
-export declare function sendPrompt(endpoint: ServiceEndpoint, sessionID: string, prompt: string): Promise<void>;
+export declare function sendPrompt(endpoint: ServiceEndpoint, sessionID: string, prompt: string, attachments?: readonly PromptAttachment[]): Promise<void>;
 /**
  * Pending interaction the agent is blocked on.
  *
@@ -211,9 +217,11 @@ export interface TimelineEntry {
     /**
      * Rendering hint. `chat` is a normal user/assistant bubble; `tool` is an
      * intermediate process row (the CLI equivalent of "→ shell ..."); `error`
-     * is a failed turn.
+     * is a failed turn; `image` is one or more inline images a prompt carried.
      */
-    readonly kind?: "chat" | "tool" | "error";
+    readonly kind?: "chat" | "tool" | "error" | "image";
+    /** Data URLs for `kind: "image"` rows. */
+    readonly images?: readonly string[];
     /** Tool name for `kind: "tool"` rows. */
     readonly tool?: string;
     /** Tool call status (`running` / `completed` / `error`) for tool rows. */
@@ -224,20 +232,6 @@ export interface TimelineEntry {
  * command / path it is about to touch, not the whole JSON blob).
  */
 export declare function toolSummary(name: string, input: Record<string, unknown> | undefined): string;
-/**
- * Flatten the projected message timeline into renderable rows.
- *
- * The v2 projection puts visible text under `content` (not `parts`) and labels
- * the row with `type` (`user` | `assistant` | `idle`) rather than `role`.
- *
- * Every content block becomes its own row so the panel can mirror the CLI:
- * `text` blocks render as chat bubbles, `tool` blocks render as process rows
- * (name + status + a one-line argument summary). Reasoning blocks stay
- * dropped — they are private scratch work, not progress.
- *
- * The projection returns newest first; the chat panel renders oldest first,
- * so the flattened rows are reversed here once.
- */
 export declare function readTimeline(endpoint: ServiceEndpoint, sessionID: string): Promise<TimelineEntry[]>;
 /**
  * Final outcome of a turn started at or after `sinceMs`, or `undefined` while

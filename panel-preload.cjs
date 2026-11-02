@@ -32,8 +32,17 @@ contextBridge.exposeInMainWorld("openpetsPanel", {
   chatModel: () => {
     return ipcRenderer.invoke("openpets:pet-chat-model");
   },
-  chatSend: (text) => {
-    return ipcRenderer.invoke("openpets:pet-chat-send", text);
+  chatSend: (text, images) => {
+    // `images` are `{ uri, name }` data URLs; the main process re-validates
+    // every one of them before admitting the prompt.
+    const payload = { text: typeof text === "string" ? text : "", images: Array.isArray(images) ? images : [] };
+    return ipcRenderer.invoke("openpets:pet-chat-send", payload);
+  },
+  // Native image picker. Doing this in the main process keeps the panel open:
+  // the dialog steals focus, and a renderer-side <input type=file> cannot tell
+  // the panel's blur handler to stand down.
+  pickImages: () => {
+    return ipcRenderer.invoke("openpets:panel-pick-images");
   },
   chatStop: () => {
     return ipcRenderer.invoke("openpets:pet-chat-stop");
