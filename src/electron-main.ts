@@ -56,6 +56,7 @@ import {
 } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { ensureOpenCodeService, type EnsureResult } from "./opencode-ensure.js";
+import { checkForUpdate, downloadUpdate, installUpdate, isPortableInstall, type UpdateInfo } from "./app-update.js";
 import { readSessionRecords, readActiveRecord, saveSessionRecord, sessionRecordKey } from "./session-record.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor, type SummonRequest } from "./summon.js";
 
@@ -498,10 +499,12 @@ function publishPanelState(pet: PetInstance | undefined): void {
   if (pet === undefined) return;
   // The panel owns its header now; push the bound session title there so a
   // session switch updates it without waiting for a history round-trip.
+  const updatePayload = updateInfo === undefined ? undefined : { version: updateInfo.latest, status: updateStatus };
   if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
     pet.panelWindow.webContents.send("openpets:pet-panel-state", {
       chatExpanded: pet.chatExpanded,
       sessionTitle: pet.sessionTitle ?? "",
+      update: updatePayload,
     });
   }
   // The pet window still needs the flag to keep its own affordances in sync.
@@ -509,6 +512,7 @@ function publishPanelState(pet: PetInstance | undefined): void {
     pet.window.webContents.send("openpets:pet-panel-state", {
       chatExpanded: pet.chatExpanded,
       sessionTitle: pet.sessionTitle ?? "",
+      update: updatePayload,
     });
   }
 }
@@ -991,6 +995,79 @@ async function attachSession(
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }
+}
+
+//
+// 版本更新（GitHub Release 检查 + 下载 + 静默安装）
+//
+let updateInfo: UpdateInfo | undefined;
+/** "" 空闲 / "下载中 43%" / "已下载，正在退出并安装…"，展示在面板更新条上。 */
+let updateStatus = "";
+
+/** Push the current update bar text onto every pet's chat panel. */
+function publishUpdateStatus(): void {
+  for (const pet of pets.values()) publishPanelState(pet);
+}
+
+/** Check GitHub once; announces to every pet when a newer release exists. */
+async function runUpdateCheck(announceTo?: PetInstance): Promise<void> {
+  const info = await checkForUpdate(app.getVersion());
+  if (info === undefined) {
+    if (announceTo !== undefined) say(announceTo, `当前已是最新版本（v${app.getVersion()}）`);
+    return;
+  }
+  updateInfo = info;
+  for (const pet of pets.values()) say(pet, `发现新版本 v${info.latest}！在对话面板或右键菜单都可以更新`);
+  publishUpdateStatus();
+}
+
+/** Download then hand over to the installer (NSIS silent / portable swap). */
+async function beginPetUpdate(announceTo?: PetInstance): Promise<void> {
+  if (updateRunning()) return;
+  if (updateInfo === undefined) {
+    await runUpdateCheck(announceTo);
+    if (updateInfo === undefined) return;
+  }
+  const info = updateInfo;
+  const announce = (message: string) => {
+    console.log(`[update] ${message}`);
+    if (announceTo !== undefined) say(announceTo, message);
+  };
+  setUpdateRunning(true);
+  try {
+    updateStatus = "下载中 0%";
+    publishUpdateStatus();
+    const result = await downloadUpdate(info, (received, total) => {
+      if (total <= 0) return;
+      const next = `下载中 ${Math.min(100, Math.round((received / total) * 100))}%`;
+      if (next !== updateStatus) {
+        updateStatus = next;
+        publishUpdateStatus();
+      }
+    });
+    if (!result.ok || result.installerPath === undefined) {
+      announce(`更新下载失败：${result.error ?? "未知错误"}`);
+      updateStatus = "";
+      return;
+    }
+    updateStatus = "已下载，正在退出并安装…";
+    publishUpdateStatus();
+    announce(`v${info.latest} 已下载，正在退出并安装新版本…`);
+    await installUpdate(info, result.installerPath);
+    // The helper script gates on this process being gone, so quit promptly.
+    setTimeout(() => app.quit(), 2500);
+  } finally {
+    setUpdateRunning(false);
+  }
+}
+
+/** Concurrent-download guard; kept as plain module state for testability. */
+let updateRunningFlag = false;
+function updateRunning(): boolean {
+  return updateRunningFlag;
+}
+function setUpdateRunning(running: boolean): void {
+  updateRunningFlag = running;
 }
 
 /**
@@ -1572,6 +1649,18 @@ async function showPetContextMenu(pet: PetInstance): Promise<void> {
 
   const outfitItems = buildOutfitMenuItems(pet);
   const menu = Menu.buildFromTemplate([
+    {
+      label: updateRunning()
+        ? `更新 v${updateInfo?.latest ?? ""} · ${updateStatus || "进行中"}`
+        : updateInfo === undefined
+          ? `检查更新（当前 v${app.getVersion()}）`
+          : `升级到 v${updateInfo.latest}`,
+      type: "normal",
+      enabled: !updateRunning(),
+      click: () => {
+        void beginPetUpdate(pet);
+      },
+    },
     { label: "选择 model", submenu: modelItems },
     ...(outfitItems.length > 0 ? [{ label: "换装", submenu: outfitItems }] : []),
     {
@@ -1771,6 +1860,13 @@ function createTray(): void {
         })();
       },
     },
+    {
+      label: "检查更新 / 安装新版本",
+      type: "normal",
+      click: () => {
+        void beginPetUpdate(focusedPet());
+      },
+    },
     { label: "退出", type: "normal", click: () => app.quit() },
   ]));
 }
@@ -1863,6 +1959,11 @@ function installIpc(): void {
     const pet = petForPanelSender(event.sender);
     if (pet === undefined) return;
     setChatExpanded(pet, false);
+  });
+  // Version-update button in the panel's update bar (empty when up to date).
+  ipcMain.handle("openpets:panel-request-update", (event) => {
+    void beginPetUpdate(petForPanelSender(event.sender));
+    return { ok: true };
   });
   // Temporary diagnostics: the panel runs without a devtools console the user
   // can open, so it forwards log lines here and they land in a file next to the
@@ -2174,6 +2275,9 @@ void app.whenReady().then(async () => {
   void ensureOpenCodeReady();
   currentPetEntry = await resolveDefaultPet(app.getPath("userData"));
   createTray();
+  // Update notice: checked shortly after startup so the check never competes
+  // with the bring-up chain for the first network responses.
+  setTimeout(() => void runUpdateCheck(focusedPet()), 10_000);
   const startupSummon = parseSummonRequest(process.argv);
   const firstPet = createPetWindow(
     startupSummon === undefined ? {} : { directory: startupSummon.directory, petEntry: await pickPetEntryForNewWindow() },

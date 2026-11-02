@@ -51,6 +51,11 @@ contextBridge.exposeInMainWorld("openpetsPanel", {
   closePanel: () => {
     ipcRenderer.send("openpets:panel-close");
   },
+  // Update bar: downloads the newer GitHub release and hands over to its
+  // installer; the main process then quits and relaunches.
+  requestUpdate: () => {
+    return ipcRenderer.invoke("openpets:panel-request-update");
+  },
   // Temporary diagnostics: the panel has no console the user can open, so log
   // lines are forwarded to the main process, which appends them to a file.
   debugLog: (message) => {

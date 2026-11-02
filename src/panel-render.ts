@@ -109,6 +109,11 @@ export function createPanelPageHtml(options: PanelPageOptions = {}): string {
   .chat-send-btn:hover { filter: brightness(1.06); }
   .chat-send-btn:disabled { background: rgba(203, 213, 225, 0.45); color: #94a3b8; cursor: not-allowed; }
   .chat-model-line { flex: 0 0 auto; padding: 8px 20px 12px; font-size: 12px; line-height: 17px; color: #64748b; background: rgba(248, 250, 252, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
+  .chat-update { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 6px 20px; font-size: 12px; line-height: 17px; color: #92400e; background: #fef3c7; white-space: nowrap; overflow: hidden; user-select: none; }
+  .chat-update-text { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .chat-update-btn { flex: 0 0 auto; border: none; border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #fff; background: linear-gradient(135deg, #f59e0b, #d97706); cursor: pointer; }
+  .chat-update-btn:hover { filter: brightness(1.06); }
+  .chat-update-btn:disabled { opacity: 0.55; cursor: default; }
   @keyframes msg-appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 </head>
@@ -120,6 +125,10 @@ export function createPanelPageHtml(options: PanelPageOptions = {}): string {
       <span class="chat-title" id="chatTitle">${petNameDisplay}</span>
     </div>
     <button type="button" class="chat-close-btn" id="chatClose" title="关闭" aria-label="关闭对话">✕</button>
+  </div>
+  <div class="chat-update" id="chatUpdate" hidden>
+    <span class="chat-update-text" id="chatUpdateText"></span>
+    <button type="button" class="chat-update-btn" id="chatUpdateBtn">更新</button>
   </div>
   <div class="chat-transcript" id="chatTranscript"></div>
   <div class="chat-empty" id="chatEmpty">
@@ -760,6 +769,40 @@ export function createPanelPageHtml(options: PanelPageOptions = {}): string {
 
   window.openpetsPanel?.onAsk((ask) => { renderAsk(ask); });
 
+  // Update bar renderer: the main process pushes {version, status} on every
+  // state publish, so the progress text stays live without polling.
+  function applyUpdateBar(update) {
+    const bar = document.getElementById("chatUpdate");
+    const text = document.getElementById("chatUpdateText");
+    const button = document.getElementById("chatUpdateBtn");
+    if (!bar || !text || !button) return;
+    if (!update || typeof update !== "object" || typeof update.version !== "string" || update.version.length === 0) {
+      bar.hidden = true;
+      button.disabled = false;
+      button.textContent = "更新";
+      return;
+    }
+    const status = typeof update.status === "string" ? update.status : "";
+    const busy = status.startsWith("下载中") || status.includes("安装");
+    bar.hidden = false;
+    text.textContent = status.length > 0 ? "v" + update.version + " · " + status : "发现新版本 v" + update.version;
+    button.disabled = busy;
+    button.textContent = busy ? "进行中" : "立即更新";
+    button.onclick = () => {
+      if (busy) return;
+      button.disabled = true;
+      button.textContent = "准备中…";
+      window.openpetsPanel?.requestUpdate?.().then((result) => {
+        if (result && result.ok === false) {
+          text.textContent = result.error || "更新失败，请稍后再试";
+          button.disabled = false;
+          button.textContent = "重试";
+        }
+      });
+    };
+  }
+  applyUpdateBar(undefined);
+
   // Live progress: the main process forwards each tool call/result as it
   // happens, so process rows appear while the turn runs instead of only when
   // the panel re-reads history after the turn ends.
@@ -774,6 +817,7 @@ export function createPanelPageHtml(options: PanelPageOptions = {}): string {
       const titleEl = document.getElementById("chatTitle");
       if (titleEl) titleEl.textContent = payload.sessionTitle.trim();
     }
+    applyUpdateBar(payload.update);
     if (payload.chatExpanded === true) {
       void loadChatHistory();
       void refreshModelLine();
