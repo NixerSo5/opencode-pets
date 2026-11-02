@@ -1,29 +1,40 @@
 /**
  * app-update.ts
  *
- * GitHub-release update flow for OpenPets:
- *  1. `checkForUpdate` reads the latest release from the public GitHub API and
+ * GitHub-release update flow for OpenPets, Gitee-first:
+ *  1. `checkForUpdate` reads the latest release from the GitHub API and
  *     compares the tag against the running version.
- *  2. `downloadUpdate` streams the matching asset into a temp file with
- *     progress callbacks.
- *  3. `installUpdate` hands the run over to a detached helper: the packaged
+ *  2. `findGiteeVolumes` looks up the same tag on the Gitee mirror; when the
+ *     mirror carries split `.7z.001/.002…` volumes of the installer they are
+ *     downloaded first (fast in CN and small attachments respect Gitee's
+ *     100 MB per-file limit).
+ *  3. `extractVolumes` assembles the installer with the bundled standalone
+ *     7-Zip console (vendor/7zr.exe) into a temp dir.
+ *  4. When the mirror is unreachable or lacks volumes, `downloadUpdate`
+ *     falls back to streaming the GitHub asset (NSIS for installed builds,
+ *     portable exe for portable installs) with progress callbacks.
+ *  5. `installUpdate` hands the run over to a detached helper: the packaged
  *     app runs the NSIS installer silently after this instance has quit; the
  *     portable app renames its own running exe out of the way, drops the new
  *     one in, and relaunches once the old process is really gone.
  *
- * No autoUpdater dependency: the release assets are already on GitHub and the
- * NSIS installer knows how to install itself; the pet only choreographs it.
+ * No autoUpdater dependency: the release assets are already hosted, the NSIS
+ * installer knows how to install itself, and 7zr knows how to unpack. The
+ * pet app only choreographs.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { rename, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync, readdirSync, rmSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 const repository = "NixerSo5/opencode-pets";
+const giteeOwnerRepo = "nixer/opencode-pets";
 const releaseApiUrl = `https://api.github.com/repos/${repository}/releases/latest`;
+const giteeTagApiUrl = (tag: string) => `https://gitee.com/api/v5/repos/${giteeOwnerRepo}/releases/tags/${tag}`;
 const timeoutMs = 15_000;
 
 export interface UpdateInfo {
@@ -33,10 +44,12 @@ export interface UpdateInfo {
   readonly latest: string;
   /** Human-visible release page. */
   readonly releaseUrl: string;
-  /** Direct asset download URL for this install mode. */
+  /** Direct asset download URL for this install mode (GitHub fallback). */
   readonly assetUrl: string;
   readonly assetName: string;
   readonly assetSize: number;
+  /** Gitee mirror attachment list for the same tag, in part order. */
+  readonly giteeVolumes?: readonly { readonly name: string; readonly url: string; readonly size: number }[];
 }
 
 export interface DownloadResult {
@@ -46,6 +59,21 @@ export interface DownloadResult {
 }
 
 export type DownloadProgress = (received: number, total: number) => void;
+
+/** Where the bundled extractable 7-Zip console lives (packaged or dev). */
+function bundled7zPath(): string | undefined {
+  // dist/app-update.js → ../vendor/7zr.exe in the repo; packaged installs
+  // ship it as an extraResource next to resourcesPath.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates: string[] = [join(here, "..", "vendor", "7zr.exe")];
+  if (typeof process.resourcesPath === "string" && process.resourcesPath.length > 0) {
+    candidates.unshift(join(process.resourcesPath, "vendor", "7zr.exe"));
+  }
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
 
 /** Packaged install (NSIS) vs portable exe, detected from the environment. */
 export function isPortableInstall(): boolean {
@@ -125,6 +153,13 @@ export async function checkForUpdate(current: string): Promise<UpdateInfo | unde
       console.log(`[update] release ${latest} has no asset for mode=${mode}`);
       return undefined;
     }
+    // Prefer the Gitee mirror (CN-fast, fits the 100 MB attachment limit via
+    // split volumes); undefined when the mirror has no release for this tag,
+    // which sends the download to the GitHub asset directly.
+    const giteeVolumes = mode === "nsis" ? await findGiteeVolumes(latest) : undefined;
+    if (mode === "nsis" && giteeVolumes === undefined) {
+      console.log("[update] gitee mirror unavailable or volume-less; will fall back to github");
+    }
     console.log(`[update] available: ${current} -> ${latest} (${asset.name})`);
     return {
       current,
@@ -133,10 +168,137 @@ export async function checkForUpdate(current: string): Promise<UpdateInfo | unde
       assetUrl: asset.url,
       assetName: asset.name,
       assetSize: asset.size,
+      giteeVolumes,
     };
   } catch (error) {
     console.log(`[update] check failed: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
+  }
+}
+
+export interface GiteeVolume {
+  readonly name: string;
+  readonly url: string;
+  readonly size: number;
+}
+
+/**
+ * Read the mirror release for `version` and list its `.7z.NNN` split volumes
+ * in part order. Public read needs no token; undefined on any miss so the
+ * caller falls back to GitHub without retries.
+ */
+export async function findGiteeVolumes(version: string): Promise<readonly GiteeVolume[] | undefined> {
+  try {
+    const response = await fetch(giteeTagApiUrl(`v${version}`), {
+      headers: { "User-Agent": "openpets-release" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      console.log(`[update] gitee release ${version}: HTTP ${response.status}`);
+      return undefined;
+    }
+    const release = (await response.json()) as {
+      assets?: Array<{ name: string; browser_download_url: string; size?: number }>;
+    } | undefined;
+    if (release === undefined || typeof release !== "object") {
+      console.log(`[update] gitee release ${version}: missing`);
+      return undefined;
+    }
+    const volumes = (release.assets ?? [])
+      .filter((asset) => /\.7z\.\d{3}$/.test(asset.name) && asset.browser_download_url !== undefined)
+      .map((asset) => ({ name: asset.name, url: asset.browser_download_url, size: Number(asset.size ?? 0) }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    return volumes.length > 0 ? volumes : undefined;
+  } catch (error) {
+    console.log(`[update] gitee check failed: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * Download every mirror volume into `destDir`, reporting progress as
+ * (receivedInPart, totalInPart). Volumes stream one after another; a failed
+ * part aborts the whole chain (partial files all removed).
+ */
+export async function downloadGiteeVolumes(
+  volumes: readonly GiteeVolume[],
+  destDir: string,
+  onProgress?: DownloadProgress,
+  onPartStart?: (name: string) => void,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    for (const volume of volumes) {
+      console.log(`[update] gitee volume ${volume.name} ← ${volume.url}`);
+      onPartStart?.(volume.name);
+      const response = await fetch(volume.url, { headers: { "User-Agent": "openpets-release" }, redirect: "follow" });
+      if (!response.ok || response.body === null) {
+        return { ok: false, error: `分卷下载失败：HTTP ${response.status}` };
+      }
+      const total = Number(response.headers.get("content-length") ?? volume.size);
+      let received = 0;
+      let lastReport = -1;
+      const stream = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
+      const file = createWriteStream(join(destDir, volume.name));
+      stream.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        if (total > 0 && onProgress !== undefined) {
+          const percent = Math.min(100, Math.round((received / total) * 100));
+          if (percent > lastReport) {
+            lastReport = percent;
+            onProgress(received, total);
+          }
+        }
+      });
+      await pipeline(stream, file);
+    }
+    return { ok: true };
+  } catch (error) {
+    rmSync(destDir, { recursive: true, force: true });
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Assemble the installer from downloaded split volumes with the bundled 7-Zip
+ * console, and return the extracted exe. No shell involved: 7zr gets argv.
+ */
+export async function extractVolumes(firstVolumePath: string, destDir: string): Promise<{ ok: boolean; installerPath?: string; error?: string }> {
+  const sevenZip = bundled7zPath();
+  if (sevenZip === undefined) {
+    return { ok: false, error: "内置 7-Zip 解压器缺失（vendor/7zr.exe）" };
+  }
+  try {
+    const result = await new Promise<{ code: number; output: string }>((resolve) => {
+      const child = spawn(sevenZip, ["x", "-y", `-o${destDir}`, firstVolumePath], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let output = "";
+      let done = false;
+      const finish = (code: number) => {
+        if (done) return;
+        done = true;
+        resolve({ code, output: output.slice(-2000) });
+      };
+      child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+      child.stderr?.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+      child.on("error", () => finish(-1));
+      child.on("close", (code) => finish(code ?? -1));
+    });
+    if (result.code !== 0) {
+      return { ok: false, error: `7zr 解压失败（exit=${result.code}）: ${result.output.trim().slice(-400)}` };
+    }
+    const extracted = readdirSync(destDir).find((name) => name.toLowerCase().endsWith(".exe")) ?? "OpenPets Setup.exe";
+    const candidates = readdirSync(destDir).filter((name) => name.toLowerCase().endsWith(".exe"));
+    const preferred = candidates.find((name) => name.toLowerCase().includes("setup")) ?? candidates[0];
+    void extracted;
+    if (preferred === undefined) {
+      return { ok: false, error: "解压完成但没有找到安装程序 exe" };
+    }
+    console.log(`[update] extracted installer: ${preferred}`);
+    return { ok: true, installerPath: join(destDir, preferred) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 

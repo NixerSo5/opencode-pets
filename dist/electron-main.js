@@ -23,7 +23,7 @@ import { pickReactionMessage } from "./reaction-messages.js";
 import { createSession, discoverService, getSession, getSessionAfterModelSwitch, interruptSession, listModels, listSessions, parseFormCreated, readTimeline, toolSummary, replyForm, deleteSession, abortRunPrompt, runPrompt, sendPrompt, setSessionModel, turnResultAfter, } from "./opencode-client.js";
 import { OpenCodeWatch } from "./opencode-watch.js";
 import { ensureOpenCodeService } from "./opencode-ensure.js";
-import { checkForUpdate, downloadUpdate, installUpdate } from "./app-update.js";
+import { checkForUpdate, downloadGiteeVolumes, downloadUpdate, extractVolumes, installUpdate, isPortableInstall } from "./app-update.js";
 import { readSessionRecords, readActiveRecord, saveSessionRecord, sessionRecordKey } from "./session-record.js";
 import { desktopDirectory, parseSummonRequest, placeAtCursor } from "./summon.js";
 const scale = 0.75;
@@ -942,26 +942,82 @@ async function beginPetUpdate(announceTo) {
     };
     setUpdateRunning(true);
     try {
-        updateStatus = "下载中 0%";
-        publishUpdateStatus();
-        const result = await downloadUpdate(info, (received, total) => {
-            if (total <= 0)
-                return;
-            const next = `下载中 ${Math.min(100, Math.round((received / total) * 100))}%`;
-            if (next !== updateStatus) {
-                updateStatus = next;
-                publishUpdateStatus();
+        let installerPath;
+        // Gitee first: split 7z volumes download fast in CN and unzip with the
+        // bundled 7zr. Portable installs skip this (mirror carries setup only),
+        // as does a mirror miss — both proceed to the GitHub asset.
+        if (!isPortableInstall() && info.giteeVolumes !== undefined && info.giteeVolumes.length > 0) {
+            const volumes = info.giteeVolumes;
+            const workDir = join(tmpdir(), `openpets-mirror-${process.pid}`);
+            await mkdir(workDir, { recursive: true });
+            try {
+                const updateVolume = (name) => {
+                    const index = volumes.findIndex((volume) => volume.name === name);
+                    if (index >= 0) {
+                        updateStatus = `下载 Gitee 分卷 ${index + 1}/${volumes.length} 0%（${name}）`;
+                        publishUpdateStatus();
+                    }
+                };
+                updateVolume(volumes[0].name);
+                let partName = volumes[0].name;
+                const download = await downloadGiteeVolumes(volumes, workDir, (received, total) => {
+                    if (total <= 0)
+                        return;
+                    const index = volumes.findIndex((volume) => volume.name === partName);
+                    const next = `下载 Gitee 分卷 ${index + 1}/${volumes.length} ${Math.min(100, Math.round((received / total) * 100))}%`;
+                    if (next !== updateStatus) {
+                        updateStatus = next;
+                        publishUpdateStatus();
+                    }
+                }, (name) => {
+                    partName = name;
+                    updateVolume(name);
+                });
+                if (!download.ok) {
+                    console.log(`[update] gitee volumes failed: ${download.error}; falling back to github`);
+                    announce(`Gitee 分卷下载失败（${download.error ?? "未知原因"}），改用 GitHub 直链下载…`);
+                }
+                else {
+                    updateStatus = "解压安装包…";
+                    publishUpdateStatus();
+                    const extracted = await extractVolumes(join(workDir, volumes[0].name), join(workDir, "installer"));
+                    if (!extracted.ok || extracted.installerPath === undefined) {
+                        console.log(`[update] gitee extract failed: ${extracted.error}; falling back to github`);
+                        announce(`Gitee 分卷解压失败（${extracted.error ?? "未知原因"}），改用 GitHub 直链下载…`);
+                    }
+                    else {
+                        installerPath = extracted.installerPath;
+                    }
+                }
             }
-        });
-        if (!result.ok || result.installerPath === undefined) {
-            announce(`更新下载失败：${result.error ?? "未知错误"}`);
-            updateStatus = "";
-            return;
+            catch (error) {
+                console.log(`[update] gitee path error: ${error instanceof Error ? error.message : String(error)}; falling back to github`);
+                announce("Gitee 通道不可用，改用 GitHub 直链下载…");
+            }
+        }
+        if (installerPath === undefined) {
+            updateStatus = "下载中 0%";
+            publishUpdateStatus();
+            const result = await downloadUpdate(info, (received, total) => {
+                if (total <= 0)
+                    return;
+                const next = `下载中 ${Math.min(100, Math.round((received / total) * 100))}%`;
+                if (next !== updateStatus) {
+                    updateStatus = next;
+                    publishUpdateStatus();
+                }
+            });
+            if (!result.ok || result.installerPath === undefined) {
+                announce(`更新下载失败：${result.error ?? "未知错误"}`);
+                updateStatus = "";
+                return;
+            }
+            installerPath = result.installerPath;
         }
         updateStatus = "已下载，正在退出并安装…";
         publishUpdateStatus();
-        announce(`v${info.latest} 已下载，正在退出并安装新版本…`);
-        await installUpdate(info, result.installerPath);
+        announce(`v${info.latest} 安装包就绪，正在退出并安装新版本…`);
+        await installUpdate(info, installerPath);
         // The helper script gates on this process being gone, so quit promptly.
         setTimeout(() => app.quit(), 2500);
     }
