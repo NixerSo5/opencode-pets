@@ -334,6 +334,24 @@ export async function replyForm(
   });
 }
 
+/** A pending question form the server still has for a session. */
+export interface SessionFormInfo {
+  readonly id: string;
+  readonly sessionID: string;
+  readonly title?: string;
+  readonly fields?: readonly unknown[];
+}
+
+/**
+ * Pending forms for a session (`session.form.list`). Unlike the SSE event this
+ * also works after an app restart or a missed event, which is what lets a
+ * reopened panel recover a question the user has not answered yet.
+ */
+export async function listSessionForms(endpoint: ServiceEndpoint, sessionID: string): Promise<SessionFormInfo[]> {
+  const body = await request<{ data: SessionFormInfo[] }>(endpoint, `/api/session/${encodeURIComponent(sessionID)}/form`);
+  return body.data ?? [];
+}
+
 /**
  * Decode an SSE `form.created` event into the panel's ask shape.
  *

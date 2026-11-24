@@ -41,6 +41,7 @@ import {
   getSessionAfterModelSwitch,
   interruptSession,
   listModels,
+  listSessionForms,
   listSessions,
   parseFormCreated,
   readTimeline,
@@ -52,6 +53,7 @@ import {
   sendPrompt,
   setSessionModel,
   turnResultAfter,
+  type AskEvent,
   type PromptAttachment,
   type ServiceEndpoint,
 } from "./opencode-client.js";
@@ -125,6 +127,8 @@ interface PetInstance {
   walkTimer: NodeJS.Timeout | null;
   /** True while a drag is in progress (suppresses reactions and walking). */
   dragging: boolean;
+  /** Unsent composer text, kept per session so closing the panel is not lossy. */
+  readonly drafts: Map<string, string>;
   /** Display id the pet's page zoom was last synced against. */
   displayId: number;
 }
@@ -757,8 +761,71 @@ interface PendingForm {
   readonly sessionID: string;
   readonly endpoint: ServiceEndpoint;
   readonly fieldKeys: readonly string[];
+  /**
+   * The exact card payload the panel renders. Kept so a panel that is opened
+   * *after* the form arrived — the usual case, since closing the chat destroys
+   * the panel window — can be handed the card again instead of showing a
+   * parked turn the user cannot answer.
+   */
+  readonly card: AskEvent;
 }
 const pendingForms = new Map<string, PendingForm>();
+
+/**
+ * Register a form (from an SSE event or from the server's form list) in the
+ * shape the main process keeps and the panel renders.
+ */
+function trackServerForm(pet: PetInstance, info: unknown): PendingForm | undefined {
+  if (pet.endpoint === undefined || pet.sessionID === undefined) return undefined;
+  const ask = parseFormCreated({ data: { form: info } });
+  if (ask === undefined || ask.sessionID !== pet.sessionID) return undefined;
+  const { sessionID: _ignored, ...card } = ask;
+  const form: PendingForm = {
+    sessionID: ask.sessionID,
+    endpoint: pet.endpoint,
+    fieldKeys: ask.fieldKeys,
+    card,
+  };
+  pendingForms.set(ask.formID, form);
+  return form;
+}
+
+/**
+ * Recover every form the server still has parked for this pet's session and
+ * hand it to a freshly opened panel.
+ *
+ * In-memory replay alone is not enough: after an app restart, a missed SSE
+ * event, or a turn that was marked interrupted while the form stayed open,
+ * `pendingForms` is empty. The server is the source of truth, so query it.
+ */
+async function restorePendingForms(pet: PetInstance, panel: BrowserWindow): Promise<void> {
+  if (pet.sessionID === undefined || pet.endpoint === undefined || panel.isDestroyed()) return;
+  const sent = new Set<string>();
+  for (const [formID, form] of pendingForms) {
+    if (form.sessionID !== pet.sessionID) continue;
+    panel.webContents.send("openpets:pet-ask", form.card);
+    sent.add(formID);
+  }
+  const infos = await listSessionForms(pet.endpoint, pet.sessionID).catch(() => []);
+  if (panel.isDestroyed() || pet.panelWindow !== panel || !pet.chatExpanded) return;
+  for (const info of infos) {
+    if (typeof info?.id === "string" && sent.has(info.id)) continue;
+    const form = trackServerForm(pet, info);
+    if (form === undefined) continue;
+    const formID = form.card.formID;
+    if (formID === undefined || sent.has(formID)) continue;
+    panel.webContents.send("openpets:pet-ask", form.card);
+    sent.add(formID);
+  }
+  if (sent.size > 0) console.log(`[ask] restored ${sent.size} pending form(s) to panel session=${pet.sessionID}`);
+}
+
+/** Register every form the server reports, without needing an open panel. */
+async function syncServerForms(pet: PetInstance, sessionID: string): Promise<void> {
+  if (pet.endpoint === undefined) return;
+  const infos = await listSessionForms(pet.endpoint, sessionID).catch(() => []);
+  for (const info of infos) trackServerForm(pet, info);
+}
 
 /**
  * Resolvers waiting for a session's agent loop to reach a terminal state.
@@ -938,12 +1005,13 @@ function startWatch(): void {
         if (ask === undefined) return;
         const pet = petForSession(ask.sessionID);
         if (pet === undefined || pet.endpoint === undefined || pet.window.isDestroyed()) return;
+        const { sessionID: _ignored, ...card } = ask;
         pendingForms.set(ask.formID, {
           sessionID: ask.sessionID,
           endpoint: pet.endpoint,
           fieldKeys: ask.fieldKeys,
+          card,
         });
-        const { sessionID: _ignored, ...card } = ask;
         // The panel renders question forms now. Open it first so the user sees
         // the options instead of a silently parked turn.
         if (!pet.chatExpanded) setChatExpanded(pet, true);
@@ -1489,6 +1557,10 @@ function setChatExpanded(pet: PetInstance, next: boolean): void {
           chatExpanded: true,
           sessionTitle: pet.sessionTitle ?? "",
         });
+        // The panel is a fresh renderer after every reopen, so any question the
+        // agent is already parked on has to be handed to it again.
+        void restorePendingForms(pet, panel);
+        panel.webContents.send("openpets:panel-draft", pet.drafts.get(pet.sessionID ?? "") ?? "");
         publishPanelState(pet);
       });
   } else if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) {
@@ -1936,6 +2008,10 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
   });
   window.setAlwaysOnTop(true, "floating");
   window.setMenu(null);
+  // Capture the id now: once the window is closed its webContents is already
+  // destroyed, so reading `window.webContents.id` inside the `closed` handler
+  // throws "Object has been destroyed" and skips the bookkeeping below.
+  const webContentsID = window.webContents.id;
   const pet: PetInstance = {
     window,
     petEntry,
@@ -1954,9 +2030,10 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
     walkTimer: null,
     dragging: false,
     displayId: -1,
+    drafts: new Map<string, string>(),
   };
-  pets.set(window.webContents.id, pet);
-  focusedPetId = window.webContents.id;
+  pets.set(webContentsID, pet);
+  focusedPetId = webContentsID;
   // (Re)pin the page zoom after every load: the renderer reloads for outfit
   // changes, and each load lets Chromium re-anchor the zoom to the creation
   // display's scale, which would make the pet resize on the other monitors.
@@ -1975,7 +2052,7 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
   // "flash then vanish" bug). Dismissing on outside clicks is handled by the
   // panel window's own blur handler in ensurePanelWindow().
   window.on("focus", () => {
-    focusedPetId = window.webContents.id;
+    focusedPetId = webContentsID;
   });
   // Pet's own right-click menu: model / new session / switch session / hide.
   window.webContents.on("context-menu", () => {
@@ -2006,15 +2083,22 @@ function createPetWindow(options: { directory?: string; position?: { x: number; 
     cancelWalk(pet);
     if (pet.revertTimer) clearTimeout(pet.revertTimer);
     if (pet.idleRevertTimer) clearTimeout(pet.idleRevertTimer);
+    // Drop any question form parked on this pet's session: its panel is gone,
+    // so nothing would ever answer it.
+    if (pet.sessionID !== undefined) {
+      for (const [formID, form] of pendingForms) {
+        if (form.sessionID === pet.sessionID) pendingForms.delete(formID);
+      }
+    }
     // The panel is a separate window, so closing the pet must close it too.
     if (pet.panelWindow !== null && !pet.panelWindow.isDestroyed()) pet.panelWindow.destroy();
     pet.panelWindow = null;
-    pets.delete(window.webContents.id);
-    if (focusedPetId === window.webContents.id) focusedPetId = undefined;
+    pets.delete(webContentsID);
+    if (focusedPetId === webContentsID) focusedPetId = undefined;
   });
-  const queued = pendingSummons.get(window.webContents.id);
+  const queued = pendingSummons.get(webContentsID);
   if (queued !== undefined) {
-    pendingSummons.delete(window.webContents.id);
+    pendingSummons.delete(webContentsID);
     window.webContents.once("did-finish-load", () => {
       void runSummon(pet, queued);
     });
@@ -2169,6 +2253,14 @@ function installIpc(): void {
     if (pet === undefined) return;
     setChatExpanded(pet, false);
   });
+  ipcMain.on("openpets:panel-draft-save", (event, text: unknown) => {
+    const pet = petForPanelSender(event.sender);
+    if (pet === undefined) return;
+    const value = typeof text === "string" ? text.slice(0, 4000) : "";
+    const key = pet.sessionID ?? "";
+    if (value.length === 0) pet.drafts.delete(key);
+    else pet.drafts.set(key, value);
+  });
   // Version-update button in the panel's update bar (empty when up to date).
   ipcMain.handle("openpets:panel-request-update", (event) => {
     void beginPetUpdate(petForPanelSender(event.sender));
@@ -2277,6 +2369,33 @@ function installIpc(): void {
         return { ok: false, error: attached.message ?? "OpenCode 服务不可用" };
       }
       publishPanelState(pet);
+    }
+    // A typed answer must also unblock a parked `question` tool. Otherwise a
+    // lost option card leaves the user typing into a session that is still
+    // waiting on a form reply — the "卡死" reported in issue #2.
+    if (text.length > 0 && pet.endpoint !== undefined) {
+      if (![...pendingForms.values()].some((form) => form.sessionID === sessionID)) {
+        await syncServerForms(pet, sessionID);
+      }
+      const form = [...pendingForms.values()].find((entry) => entry.sessionID === sessionID);
+      const formID = form?.card.formID;
+      if (form !== undefined && formID !== undefined) {
+        const answer: Record<string, string> = {};
+        for (const key of form.fieldKeys) answer[key] = text;
+        try {
+          await replyForm(form.endpoint, sessionID, formID, answer);
+          pendingForms.delete(formID);
+          const panel = pet.panelWindow;
+          if (panel !== null && !panel.isDestroyed()) {
+            panel.webContents.send("openpets:pet-ask", { ...form.card, submittedAnswers: Object.values(answer) });
+          }
+          return { ok: true, reply: `已用输入内容回答了待确认的问题：${text}` };
+        } catch (error) {
+          // Form may already be settled or the text may be invalid for it;
+          // fall through and send this as a normal prompt.
+          console.log(`[ask] typed answer failed, sending as prompt: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
     // Plan A: run the turn straight over the HTTP API the OpenCode web app uses.
     // The prompt never carries a model — the session's own model decides every

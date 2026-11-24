@@ -322,7 +322,10 @@ export function createPanelPageHtml(options = {}) {
       renderedMessageIds.add(id);
     }
     chatEmpty.style.display = "none";
-    if (role === "assistant") chatAsk.hidden = true;
+    // Only an answered card may be dismissed by a new assistant message. A
+    // late tool/event row or a history repaint must never hide a question the
+    // user has not answered yet — that is the "options disappear" bug (#2).
+    if (!askPending && role === "assistant") chatAsk.hidden = true;
     const wrap = document.createElement("div");
     wrap.className = "chat-msg is-" + role;
     const bubbleEl = document.createElement("div");
@@ -416,7 +419,8 @@ export function createPanelPageHtml(options = {}) {
     }
 
     chatEmpty.style.display = "none";
-    chatAsk.hidden = true;
+    // Same rule as addChatMessage: an unanswered question stays visible.
+    if (!askPending) chatAsk.hidden = true;
     const row = document.createElement("div");
     row.className = "chat-proc";
     applyProcessRowState(row, status);
@@ -588,6 +592,8 @@ export function createPanelPageHtml(options = {}) {
   }
 
   let loadingHistory = false;
+  /** True while the card on screen is still waiting for the user's answer. */
+  let askPending = false;
   async function loadChatHistory() {
     if (loadingHistory) { window.openpetsPanel?.debugLog?.("history skipped: already loading"); return; }
     if (!window.openpetsPanel?.chatHistory) { window.openpetsPanel?.debugLog?.("history skipped: no api"); return; }
@@ -614,10 +620,14 @@ export function createPanelPageHtml(options = {}) {
       processRows.clear();
       chatTranscript.innerHTML = "";
       chatEmpty.style.display = "none";
-      // Rebuild the transcript in arrival order. Ask cards are not part of the
-      // server projection, so they are folded back in here at their recorded
-      // position instead of being lost (or shown as plain text).
-      const pending = askRecords.slice();
+      // Ask cards are NOT part of the server projection. They live in the
+      // fixed ask area above the transcript, so folding them back into
+      // the transcript as well would render every question twice (issue #2).
+      // Only already-answered cards from *other* questions belong in history.
+      const liveFormID = activeAsk && typeof activeAsk.formID === "string" ? activeAsk.formID : undefined;
+      const pending = askRecords.filter((record) =>
+        Array.isArray(record.answers) && record.formID !== liveFormID,
+      );
       let cursor = 0;
       const flushAsksBefore = (time) => {
         while (cursor < pending.length && (time === undefined || (pending[cursor].time ?? 0) <= time)) {
@@ -687,6 +697,7 @@ export function createPanelPageHtml(options = {}) {
     if (typeof explicit !== "string") {
       chatText.value = "";
       clearPendingImages();
+      window.openpetsPanel?.saveDraft?.("");
     }
     // Queue it right away so the user sees the message was accepted, then let
     // drainSendQueue settle the bubble once the turn actually goes out.
@@ -829,7 +840,33 @@ export function createPanelPageHtml(options = {}) {
   });
 
   document.getElementById("chatClose").addEventListener("click", () => {
+    window.openpetsPanel?.saveDraft?.(chatText.value);
     if (window.openpetsPanel?.closePanel) window.openpetsPanel.closePanel();
+  });
+
+  // The panel window is destroyed on close, so the composer's DOM is gone. Keep
+  // the draft in the main process and restore it when a fresh panel opens.
+  let draftSaveTimer = null;
+  function flushDraft() {
+    if (draftSaveTimer !== null) {
+      clearTimeout(draftSaveTimer);
+      draftSaveTimer = null;
+    }
+    window.openpetsPanel?.saveDraft?.(chatText.value);
+  }
+  chatText.addEventListener("input", () => {
+    if (draftSaveTimer !== null) clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => {
+      draftSaveTimer = null;
+      window.openpetsPanel?.saveDraft?.(chatText.value);
+    }, 200);
+  });
+  window.addEventListener("blur", flushDraft);
+  window.openpetsPanel?.onDraft?.((text) => {
+    if (typeof text !== "string" || text === chatText.value) return;
+    chatText.value = text;
+    chatText.focus();
+    chatText.setSelectionRange(text.length, text.length);
   });
 
   let askCounter = 0;
@@ -840,6 +877,7 @@ export function createPanelPageHtml(options = {}) {
     if (!chatAsk || !ask || !Array.isArray(ask.questions) || ask.questions.length === 0) return;
     activeAsk = ask;
     const submitted = Array.isArray(submittedAnswers);
+    askPending = !submitted;
     // Mirror the card into the record so a later history repaint can rebuild
     // it (interactive while unanswered, read-only once answered).
     const record = askRecords.find((entry) => entry.formID === ask.formID && entry.questions === ask.questions)
@@ -974,7 +1012,7 @@ export function createPanelPageHtml(options = {}) {
     chatTranscript.scrollTop = chatTranscript.scrollHeight;
   }
 
-  window.openpetsPanel?.onAsk((ask) => { renderAsk(ask); });
+  window.openpetsPanel?.onAsk((ask) => { renderAsk(ask, ask && ask.submittedAnswers); });
 
   // Update bar renderer: the main process pushes {version, status, checked}
   // on every state publish, so the progress text stays live without polling.

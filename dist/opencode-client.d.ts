@@ -154,6 +154,19 @@ export declare function replyPermission(endpoint: ServiceEndpoint, sessionID: st
  * `q0`, `q1`, … in question order.
  */
 export declare function replyForm(endpoint: ServiceEndpoint, sessionID: string, formID: string, answer: Record<string, string>): Promise<void>;
+/** A pending question form the server still has for a session. */
+export interface SessionFormInfo {
+    readonly id: string;
+    readonly sessionID: string;
+    readonly title?: string;
+    readonly fields?: readonly unknown[];
+}
+/**
+ * Pending forms for a session (`session.form.list`). Unlike the SSE event this
+ * also works after an app restart or a missed event, which is what lets a
+ * reopened panel recover a question the user has not answered yet.
+ */
+export declare function listSessionForms(endpoint: ServiceEndpoint, sessionID: string): Promise<SessionFormInfo[]>;
 /**
  * Decode an SSE `form.created` event into the panel's ask shape.
  *

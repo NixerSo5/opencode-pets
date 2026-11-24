@@ -6,6 +6,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 let panelStateHandler = null;
 let askHandler = null;
 let processHandler = null;
+let draftHandler = null;
 ipcRenderer.on("openpets:pet-panel-state", (_event, payload) => {
   panelStateHandler?.(payload);
 });
@@ -14,6 +15,9 @@ ipcRenderer.on("openpets:pet-ask", (_event, payload) => {
 });
 ipcRenderer.on("openpets:pet-process", (_event, payload) => {
   processHandler?.(payload);
+});
+ipcRenderer.on("openpets:panel-draft", (_event, text) => {
+  draftHandler?.(text);
 });
 
 contextBridge.exposeInMainWorld("openpetsPanel", {
@@ -25,6 +29,12 @@ contextBridge.exposeInMainWorld("openpetsPanel", {
   },
   onProcess: (callback) => {
     if (typeof callback === "function") processHandler = callback;
+  },
+  onDraft: (callback) => {
+    if (typeof callback === "function") draftHandler = callback;
+  },
+  saveDraft: (text) => {
+    ipcRenderer.send("openpets:panel-draft-save", typeof text === "string" ? text : "");
   },
   chatHistory: () => {
     return ipcRenderer.invoke("openpets:pet-chat-history");
